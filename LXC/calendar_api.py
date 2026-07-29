@@ -17,7 +17,7 @@ still match the live page — view-source the widget URL and compare.
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
-import requests
+from curl_cffi import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import logging
@@ -64,7 +64,14 @@ def fetch_calendar_html(cal_type: str) -> str:
     params = dict(DEFAULT_PARAMS)
     params["calType"] = cal_type  # "day" or "week"
 
-    resp = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=15)
+    # investing.com sits behind Cloudflare bot management, which blocks on
+    # TLS/HTTP client fingerprint rather than headers -- a stock `requests`
+    # call gets a 403 here even with a full browser header set. curl_cffi's
+    # impersonate="chrome" matches Chrome's actual TLS fingerprint, which is
+    # what actually gets past it.
+    resp = requests.get(
+        BASE_URL, params=params, headers=HEADERS, timeout=15, impersonate="chrome"
+    )
     resp.raise_for_status()
     return resp.text
 
@@ -156,7 +163,7 @@ def get_calendar(range: str = Query("week", pattern="^(day|week)$")):
     try:
         html = fetch_calendar_html(range)
         events = parse_calendar(html)
-    except requests.RequestException as e:
+    except requests.exceptions.RequestException as e:
         log.error("Fetch failed: %s", e)
         raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
     except RuntimeError as e:

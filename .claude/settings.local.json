@@ -5,7 +5,17 @@
       "Read(//c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/pve-ref/**)",
       "Bash(sed -e 's#community-scripts/ProxmoxVE/main/install/#nwsheppard/herdsmancalendar/main/LXC/#g' -e 's#if whiptail --yesno \"A newer template is available.*Do you want to download and use it instead?\" 12 70; then#if true; then#' /c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/pve-ref/build.func)",
       "Bash(bash -n /c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/pve-ref/build.func.patched)",
-      "Bash(bash -n install.sh)"
+      "Bash(bash -n install.sh)",
+      "Bash(curl -s -o /dev/null -w \"HTTP_CODE:%{http_code}\\\\n\" -A \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/124.0.0.0 Safari/537.36\" \"https://sslecal2.investing.com/?columns=exc_flags,exc_currency,exc_importance,exc_actual,exc_forecast,exc_previous&category=_employment,_economicActivity,_inflation,_credit,_centralBanks,_confidenceIndex,_balance,_Bonds&importance=1,2,3&features=datepicker,timezone&countries=5&timeZone=8&lang=1&calType=week\")",
+      "Bash(curl -s -o /tmp/resp.html -w 'HTTP_CODE:%{http_code}\\\\n' -A 'Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/124.0.0.0 Safari/537.36' -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8' -H 'Accept-Language: en-US,en;q=0.9' -H 'Referer: https://www.investing.com/' -H 'Sec-Fetch-Site: same-site' -H 'Sec-Fetch-Mode: navigate' -H 'Sec-Fetch-Dest: iframe' 'https://sslecal2.investing.com/?columns=exc_flags,exc_currency,exc_importance,exc_actual,exc_forecast,exc_previous&category=_employment,_economicActivity,_inflation,_credit,_centralBanks,_confidenceIndex,_balance,_Bonds&importance=1,2,3&features=datepicker,timezone&countries=5&timeZone=8&lang=1&calType=week')",
+      "Read(//tmp/**)",
+      "Bash(curl -sD - -o /dev/null -A 'Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/124.0.0.0 Safari/537.36' -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8' -H 'Referer: https://www.investing.com/' 'https://sslecal2.investing.com/?columns=exc_flags,exc_currency,exc_importance,exc_actual,exc_forecast,exc_previous&category=_employment,_economicActivity,_inflation,_credit,_centralBanks,_confidenceIndex,_balance,_Bonds&importance=1,2,3&features=datepicker,timezone&countries=5&timeZone=8&lang=1&calType=week')",
+      "Bash(curl -sD - -o /dev/null -A \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/124.0.0.0 Safari/537.36\" \"https://www.investing.com/\")",
+      "Bash(pip3 --version)",
+      "Bash(python3 -m venv /c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/testenv)",
+      "Bash(/c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/testenv/Scripts/python.exe -)",
+      "Bash(/c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/testenv/Scripts/python.exe -m pip show curl_cffi)",
+      "Bash(/c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/testenv/Scripts/python.exe -c 'from curl_cffi import requests; print\\(requests.RequestException\\)')"
     ]
   }
 }
