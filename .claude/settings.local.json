@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/tools.func -o /c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/pve-ref/tools.func)",
-      "Read(//c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/pve-ref/**)"
+      "Read(//c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/pve-ref/**)",
+      "Bash(sed -e 's#community-scripts/ProxmoxVE/main/install/#nwsheppard/herdsmancalendar/main/LXC/#g' -e 's#if whiptail --yesno \"A newer template is available.*Do you want to download and use it instead?\" 12 70; then#if true; then#' /c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/pve-ref/build.func)",
+      "Bash(bash -n /c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/pve-ref/build.func.patched)",
+      "Bash(bash -n install.sh)"
     ]
   }
 }
