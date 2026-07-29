@@ -2,11 +2,11 @@
 #
 # Repository-ready Proxmox installer for the Herdsman Calendar API.
 #
-# Example install (once published to a GitHub repo):
-#   curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/LXC/install.sh | bash
+# Example install:
+#   curl -fsSL https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC/install.sh | bash
 #
 # Optional environment overrides:
-#   CTID=200 HOSTNAME=herdsman-calendar REPO_BASE_URL=https://raw.githubusercontent.com/<owner>/<repo>/main/LXC bash
+#   CTID=200 HOSTNAME=herdsman-calendar REPO_BASE_URL=https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC bash
 #
 # The script downloads the deployment assets from REPO_BASE_URL and then
 # creates the LXC, copies the files in, and provisions the service.
@@ -16,7 +16,7 @@ set -euo pipefail
 
 CTID="${CTID:-200}"
 HOSTNAME="${HOSTNAME:-herdsman-calendar}"
-REPO_BASE_URL="${REPO_BASE_URL:-https://raw.githubusercontent.com/OWNER/REPO/main/LXC}"
+REPO_BASE_URL="${REPO_BASE_URL:-https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
 CONTAINER_STORAGE="${CONTAINER_STORAGE:-local-lvm}"
 TEMPLATE="${TEMPLATE:-debian-12-standard_12.7-1_amd64.tar.zst}"
@@ -36,11 +36,6 @@ fi
 
 if ! command -v curl >/dev/null 2>&1; then
     echo "Error: curl is required to download the deployment files." >&2
-    exit 1
-fi
-
-if [[ "$REPO_BASE_URL" == *"OWNER/REPO"* ]]; then
-    echo "Error: set REPO_BASE_URL to your published repository location before running this installer." >&2
     exit 1
 fi
 

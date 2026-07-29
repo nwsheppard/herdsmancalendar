@@ -18,13 +18,13 @@ widget and serves clean JSON for an ESP32-based terminal client.
 Once this folder is published to a GitHub repository, you can install it directly on a Proxmox host with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/LXC/install.sh | REPO_BASE_URL=https://raw.githubusercontent.com/<owner>/<repo>/main/LXC bash
+curl -fsSL https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC/install.sh | REPO_BASE_URL=https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC bash
 ```
 
 Optional overrides:
 
 ```bash
-CTID=200 HOSTNAME=herdsman-calendar CORES=2 MEMORY=1024 SWAP=1024 REPO_BASE_URL=https://raw.githubusercontent.com/<owner>/<repo>/main/LXC bash
+CTID=200 HOSTNAME=herdsman-calendar CORES=2 MEMORY=1024 SWAP=1024 REPO_BASE_URL=https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC bash
 ```
 
 ## Manual flow

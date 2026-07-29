@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd \"c:\\\\Users\\\\nwshe\\\\Development\\\\CRT Terminal\\\\LXC\"; python - <<'PY'\nfrom pathlib import Path\np = Path\\('install\\.sh'\\)\ntext = p\\.read_text\\(encoding='utf-8'\\)\np\\.write_text\\(text\\.replace\\('\\\\r\\\\n','\\\\n'\\)\\.replace\\('\\\\r','\\\\n'\\), encoding='utf-8', newline='\\\\n'\\)\nPY\nbash -n install\\.sh ; echo \"install\\.sh syntax OK\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
