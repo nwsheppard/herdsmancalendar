@@ -1,0 +1,21 @@
+name: Shell syntax check
+
+on:
+  push:
+    paths:
+      - '**/*.sh'
+  pull_request:
+    paths:
+      - '**/*.sh'
+
+jobs:
+  shell-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shell scripts
+        run: |
+          bash -n install.sh
+          bash -n 01-create-lxc.sh
+          bash -n 02-provision.sh
+          bash -n update.sh
