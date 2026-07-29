@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/tools.func -o /c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/pve-ref/tools.func)",
+      "Read(//c/Users/nwshe/AppData/Local/Temp/claude/c--Users-nwshe-Development-CRT-Terminal/c0029754-3789-4cf5-8e4e-d45e926fc53f/scratchpad/pve-ref/**)"
+    ]
+  }
+}

@@ -16,6 +16,4 @@ jobs:
       - name: Validate shell scripts
         run: |
           bash -n install.sh
-          bash -n 01-create-lxc.sh
-          bash -n 02-provision.sh
-          bash -n update.sh
+          bash -n herdsman-calendar-install.sh

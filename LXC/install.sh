@@ -1,89 +1,60 @@
 #!/usr/bin/env bash
+source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func | sed 's#community-scripts/ProxmoxVE/main/install/#nwsheppard/herdsmancalendar/main/LXC/#g')
+# Copyright (c) 2021-2026 nwsheppard
+# Author: nwsheppard
+# License: MIT | https://github.com/nwsheppard/herdsmancalendar/blob/main/LXC/LICENSE
+# Source: https://github.com/nwsheppard/herdsmancalendar
 #
-# Repository-ready Proxmox installer for the Herdsman Calendar API.
-#
-# Example install:
-#   curl -fsSL https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC/install.sh | bash
-#
-# Optional environment overrides:
-#   CTID=200 HOSTNAME=herdsman-calendar REPO_BASE_URL=https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC bash
-#
-# The script downloads the deployment assets from REPO_BASE_URL and then
-# creates the LXC, copies the files in, and provisions the service.
-#
+# This sources the real community-scripts/ProxmoxVE build.func to get the
+# same interactive experience their scripts provide (Default/Advanced
+# Install menu, storage + resource prompts, container creation). The `sed`
+# above only rewrites the one line in build.func that fetches the per-app
+# install script -- that line is hardcoded to community-scripts' own repo,
+# so it has to be redirected at fetch time for a private app like this one.
+# Everything else (core.func, error_handler.func, tools.func) loads
+# unmodified straight from their repo, so this always tracks their latest
+# helper behavior with nothing vendored here to fall out of date.
 
-set -euo pipefail
+APP="Herdsman-Calendar"
+var_tags="${var_tags:-finance}"
+var_cpu="${var_cpu:-1}"
+var_ram="${var_ram:-512}"
+var_disk="${var_disk:-4}"
+var_os="${var_os:-debian}"
+var_version="${var_version:-12}"
+var_unprivileged="${var_unprivileged:-1}"
 
-CTID="${CTID:-200}"
-HOSTNAME="${HOSTNAME:-herdsman-calendar}"
-REPO_BASE_URL="${REPO_BASE_URL:-https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC}"
-TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
-CONTAINER_STORAGE="${CONTAINER_STORAGE:-local-lvm}"
-TEMPLATE="${TEMPLATE:-debian-12-standard_12.7-1_amd64.tar.zst}"
-CORES="${CORES:-1}"
-MEMORY="${MEMORY:-512}"
-SWAP="${SWAP:-512}"
-ROOTFS_SIZE="${ROOTFS_SIZE:-4}"
-BRIDGE="${BRIDGE:-vmbr0}"
-WORK_DIR="${WORK_DIR:-$(mktemp -d)}"
+header_info "$APP"
+variables
+color
+catch_errors
 
-trap 'rm -rf "$WORK_DIR"' EXIT
+function update_script() {
+  header_info
+  check_container_storage
+  check_container_resources
 
-if ! command -v pct >/dev/null 2>&1; then
-    echo "Error: pct is not available on this Proxmox host." >&2
-    exit 1
-fi
+  if [[ ! -d /opt/herdsman-calendar ]]; then
+    msg_error "No ${APP} Installation Found!"
+    exit
+  fi
 
-if ! command -v curl >/dev/null 2>&1; then
-    echo "Error: curl is required to download the deployment files." >&2
-    exit 1
-fi
+  msg_info "Updating ${APP}"
+  systemctl stop herdsman-calendar-api
+  curl -fsSL "https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC/calendar_api.py" -o /opt/herdsman-calendar/calendar_api.py
+  curl -fsSL "https://raw.githubusercontent.com/nwsheppard/herdsmancalendar/main/LXC/requirements.txt" -o /opt/herdsman-calendar/requirements.txt
+  $STD /opt/herdsman-calendar/venv/bin/pip install -r /opt/herdsman-calendar/requirements.txt
+  systemctl start herdsman-calendar-api
+  msg_ok "Updated Successfully!"
+  exit
+}
 
-if [[ "$REPO_BASE_URL" != http* ]]; then
-    echo "Error: REPO_BASE_URL must be a valid HTTP(S) URL." >&2
-    exit 1
-fi
+start
+build_container
+description
 
-for asset in calendar_api.py requirements.txt herdsman-calendar-api.service 02-provision.sh update.sh; do
-    echo "== Downloading $asset =="
-    curl -fsSL "$REPO_BASE_URL/$asset" -o "$WORK_DIR/$asset"
-done
-
-echo "== Checking for template $TEMPLATE =="
-if ! pveam list "$TEMPLATE_STORAGE" | grep -q "$TEMPLATE"; then
-    echo "Template not found locally; downloading..."
-    pveam update
-    pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
-fi
-
-echo "== Creating LXC $CTID ($HOSTNAME) =="
-pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
-    --hostname "$HOSTNAME" \
-    --cores "$CORES" \
-    --memory "$MEMORY" \
-    --swap "$SWAP" \
-    --rootfs "${CONTAINER_STORAGE}:${ROOTFS_SIZE}" \
-    --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp" \
-    --unprivileged 1 \
-    --features nesting=1 \
-    --onboot 1 \
-    --start 1
-
-echo "== Waiting for the container to become reachable =="
-sleep 8
-
-echo "== Preparing /root/deploy inside the container =="
-pct exec "$CTID" -- mkdir -p /root/deploy
-
-echo "== Copying deployment files into the container =="
-pct push "$CTID" "$WORK_DIR/calendar_api.py" /root/deploy/calendar_api.py
-pct push "$CTID" "$WORK_DIR/requirements.txt" /root/deploy/requirements.txt
-pct push "$CTID" "$WORK_DIR/herdsman-calendar-api.service" /root/deploy/herdsman-calendar-api.service
-pct push "$CTID" "$WORK_DIR/02-provision.sh" /root/deploy/02-provision.sh
-pct push "$CTID" "$WORK_DIR/update.sh" /root/deploy/update.sh
-
-echo "== Running the container provisioning script =="
-pct exec "$CTID" -- bash /root/deploy/02-provision.sh
-
-echo "== Done =="
-echo "The service should soon be reachable at http://<container-ip>:8080"
+msg_ok "Completed Successfully!\n"
+echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
+echo -e "${INFO}${YW}Access it using the following URLs:${CL}"
+echo -e "${GATEWAY}${BGN}http://${IP}:8080/calendar?range=day${CL}"
+echo -e "${GATEWAY}${BGN}http://${IP}:8080/calendar?range=week${CL}"
