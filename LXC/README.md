@@ -132,10 +132,23 @@ nothing here ever reads, so it's never requested at all.
   Volatility Expected") as the primary signal instead, with icon-counting
   as a fallback — semantic text is less likely to silently drift than a
   CSS class name. If impact detection breaks again, check `title` first.
-- `columns` must keep `exc_flags,exc_currency` even though nothing in the
-  UI displays the flag icon — dropping them removes the currency-code cell
-  from the HTML entirely, not just the visual flag. Confirmed directly by
-  fetching the page with and without them.
+- The `columns`/`exc_currency` requirement above (see "Filters" section) is
+  the same kind of stale-selector risk — confirmed directly by fetching the
+  page with and without `exc_currency`, not guessed.
+- The `day` field came back `null` for every event for a while: the
+  day-separator rows (e.g. "Monday, July 27, 2026") turned out to be a
+  `<tr>` with no `class`/`id` of its own — the `theDay` class this scraper
+  checked for actually lives on that row's single child `<td>`. On top of
+  that, the row query itself (`table.find_all("tr", id=...)`) only ever
+  selected rows whose `id` contains `eventRowId`, so the separator row was
+  filtered out before the loop even got a chance to look at it — the
+  `"theDay" in classes` check was dead code from the start, not something
+  that broke later. Fixed by selecting every `<tr>` in the table and
+  checking each row's shape instead of pre-filtering by `id`: a row
+  containing a child `<td class="theDay">` sets the current day, anything
+  else without `eventRowId` in its own `id` (the header row, and the hidden
+  per-event `eventInfoNNN` detail rows) is skipped, and everything else is
+  parsed as an event row as before.
 - A cache layer would be a good next step if the API is polled frequently.
 
 ## License

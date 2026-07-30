@@ -275,17 +275,31 @@ def parse_calendar(html: str) -> list[dict]:
             "investing.com's markup may have changed. Check selectors."
         )
 
-    rows = table.find_all("tr", id=lambda v: v and EVENT_ROW_ID_SUBSTR in v)
+    # Day-separator rows (e.g. "Monday, July 27, 2026") aren't identified by
+    # an `id` -- only real event rows have one (containing
+    # EVENT_ROW_ID_SUBSTR) -- so they can't be picked out by the same
+    # `id`-based filter used below. Selecting all <tr> up front and checking
+    # each one's shape in the loop is the only way to see both.
+    rows = table.find_all("tr")
     events = []
 
     current_day = None
 
     for row in rows:
-        classes = row.get("class") or []
+        # The day-separator row is a single <td class="theDay" colspan="8">
+        # holding the date text -- the class lives on that cell, not on the
+        # <tr> itself (verified directly: the <tr> has no class or id of its
+        # own at all, so a previous version of this check, which looked for
+        # "theDay" in the *row's* class, could never match).
+        day_cell = row.find("td", {"class": "theDay"})
+        if day_cell is not None:
+            current_day = day_cell.get_text(strip=True)
+            continue
 
-        # Day separator rows typically carry the date and no event data.
-        if "theDay" in classes:
-            current_day = row.get_text(strip=True)
+        row_id = row.get("id") or ""
+        if EVENT_ROW_ID_SUBSTR not in row_id:
+            # Header row, and the hidden per-event "eventInfoNNN" detail rows
+            # (class noHover/displayNone) -- neither carries data we want.
             continue
 
         try:
