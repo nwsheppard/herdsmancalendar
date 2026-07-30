@@ -1,21 +1,44 @@
 """
 Herdsman Trading Terminal — Economic Calendar API
 
-Scrapes the investing.com economic calendar widget (sslecal2.investing.com)
-and re-serves it as clean JSON for the ESP32 to consume.
+Scrapes the Forex Factory economic calendar (forexfactory.com/calendar) and
+re-serves it as clean JSON for the ESP32 to consume.
+
+Switched from investing.com to Forex Factory (2026-07): investing.com's
+calendar carries a lot of low-value noise even after filtering (confidence
+indices, minor auctions, etc.), and Forex Factory is the calendar most
+traders already use day to day. Forex Factory also turned out to need less
+infrastructure, not more, despite a well-known scraper for it
+(github.com/fizahkhalid/forex_factory_calendar_news_scraper) using Selenium:
+the calendar's event data is server-rendered in the initial HTML response
+(verified directly), so the same lightweight requests+BeautifulSoup approach
+already used for investing.com works here too -- no headless Chrome/chromedriver
+needed in the LXC container.
+
+This was a full replacement, not an added option: Forex Factory has no
+equivalent to investing.com's "category" concept (Employment/Inflation/
+Central Banks/...), so that filter dimension is gone, not translated.
+Filtering by country also became filtering by currency -- Forex Factory
+organizes events by currency (9 of them: the majors plus CNY), not by
+country, which is a smaller and simpler set than investing.com's 107
+countries. An old filters.json from before this switch is incompatible
+(numeric country codes don't map onto currency codes) and gets reset to
+DEFAULT_FILTERS rather than migrated -- see load_filters().
 
 Endpoints:
   GET  /calendar?range=day    -> today's events, filtered per filters.json
   GET  /calendar?range=week   -> this week's events (default)
-  GET  /filters                -> current impact-level/country filter selection
+  GET  /filters                -> current impact-level/currency filter selection
   POST /filters                -> update the filter selection (persisted to filters.json)
-  GET  /countries              -> all countries investing.com supports, for a picker UI
+  GET  /currencies              -> all currencies Forex Factory's calendar covers, for a picker UI
+  GET  /columns                 -> optional per-event fields the ESP32 can choose to display
   GET  /health                 -> simple liveness check
 
-NOTE ON MAINTENANCE: this scrapes investing.com's HTML, which can change
+NOTE ON MAINTENANCE: this scrapes forexfactory.com's HTML, which can change
 without notice. If events stop appearing, the first thing to check is
-whether the CSS selectors below (WIDGET_TABLE_ID, EVENT_ROW_SELECTOR, etc.)
-still match the live page — view-source the widget URL and compare.
+whether the CSS selectors below (WIDGET_TABLE_CLASS, calendar__* cell
+classes, IMPACT_ICON_SUFFIX_LEVELS) still match the live page — view-source
+the calendar URL and compare.
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -48,136 +71,74 @@ app = FastAPI(title="Herdsman Trading Terminal Calendar API", lifespan=lifespan)
 
 # --- Configuration -----------------------------------------------------
 
-BASE_URL = "https://sslecal2.investing.com/"
+BASE_URL = "https://www.forexfactory.com/calendar"
 
-# importance/countries/categories/columns are no longer static here --
-# they're loaded from FILTERS_PATH (see load_filters()) so each deployment
-# can configure its own selection via GET/POST /filters instead of a
-# firmware/code change. features/lang/timeZone are display prefs for
-# investing.com's own rendering -- harmless to keep even though we're
-# parsing the HTML ourselves.
-DEFAULT_PARAMS = {
-    "features": "datepicker,timezone",
-    "timeZone": "8",
-    "lang": "1",
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
 }
 
-# exc_currency is always requested regardless of the user's `columns`
-# selection: dropping it doesn't just blank the currency field, it corrupts
-# the row's HTML entirely (verified directly) -- investing.com omits the
-# flagCur cell's closing </td>, so every later cell in that row (event,
-# actual, forecast, previous) ends up nested inside it instead of being a
-# sibling. exc_flags is the (never-displayed) flag icon and is never
-# requested -- dropping it is safe and there's no reason to ask for it.
-ALWAYS_REQUESTED_COLUMNS = "exc_currency"
-
-# --- Filters (impact level + countries), user-configurable via /filters ----
+# --- Filters (impact level + currencies), user-configurable via /filters ----
 
 FILTERS_PATH = Path(__file__).parent / "filters.json"
 DEFAULT_FILTERS = {
     "importance": [2, 3],
-    "countries": [5],
-    "categories": [
-        "_employment", "_economicActivity", "_inflation",
-        "_credit", "_centralBanks", "_Bonds",
-    ],
-    "columns": ["exc_importance", "exc_actual", "exc_forecast", "exc_previous"],
+    "currencies": ["USD"],
+    "columns": ["impact", "actual", "forecast", "previous"],
 }
 
-# Every country investing.com's economic calendar widget supports, scraped
-# directly from investing.com's own widget customization tool
-# (investing.com/webmaster-tools/economic-calendar, each country checkbox's
-# `id` attribute is its code) -- not a guessed/third-party list. Re-scrape
-# that page if a code is ever suspected stale; investing.com doesn't publish
-# this mapping anywhere else.
-COUNTRY_NAMES = {
-    4: "United Kingdom", 5: "United States", 6: "Canada", 7: "Mexico",
-    8: "Bermuda", 9: "Sweden", 10: "Italy", 11: "South Korea",
-    12: "Switzerland", 14: "India", 15: "Costa Rica", 17: "Germany",
-    20: "Nigeria", 21: "Netherlands", 22: "France", 23: "Israel",
-    24: "Denmark", 25: "Australia", 26: "Spain", 27: "Chile",
-    29: "Argentina", 32: "Brazil", 33: "Ireland", 34: "Belgium",
-    35: "Japan", 36: "Singapore", 37: "China", 38: "Portugal",
-    39: "Hong Kong", 41: "Thailand", 42: "Malaysia", 43: "New Zealand",
-    44: "Pakistan", 45: "Philippines", 46: "Taiwan", 47: "Bangladesh",
-    48: "Indonesia", 51: "Greece", 52: "Saudi Arabia", 53: "Poland",
-    54: "Austria", 55: "Czech Republic", 56: "Russia", 57: "Kenya",
-    59: "Egypt", 60: "Norway", 61: "Ukraine", 63: "Turkiye",
-    66: "Iraq", 68: "Lebanon", 70: "Bulgaria", 71: "Finland",
-    72: "Euro Zone", 74: "Ghana", 75: "Zimbabwe", 78: "Cote D'Ivoire",
-    80: "Rwanda", 82: "Mozambique", 84: "Zambia", 85: "Tanzania",
-    86: "Angola", 87: "Oman", 89: "Estonia", 90: "Slovakia",
-    92: "Jordan", 93: "Hungary", 94: "Kuwait", 95: "Albania",
-    96: "Lithuania", 97: "Latvia", 100: "Romania", 102: "Kazakhstan",
-    103: "Luxembourg", 105: "Morocco", 106: "Iceland", 107: "Cyprus",
-    109: "Malta", 110: "South Africa", 111: "Malawi", 112: "Slovenia",
-    113: "Croatia", 114: "Azerbaijan", 119: "Jamaica", 121: "Ecuador",
-    122: "Colombia", 123: "Uganda", 125: "Peru", 138: "Venezuela",
-    139: "Mongolia", 143: "United Arab Emirates", 145: "Bahrain",
-    148: "Paraguay", 162: "Sri Lanka", 163: "Botswana", 168: "Uzbekistan",
-    170: "Qatar", 172: "Namibia", 174: "Bosnia-Herzegovina", 178: "Vietnam",
-    180: "Uruguay", 188: "Mauritius", 193: "Palestinian Territory",
-    202: "Tunisia", 204: "Kyrgyzstan", 232: "Cayman Islands", 238: "Serbia",
-    247: "Montenegro",
+# Every currency Forex Factory's calendar covers -- the majors plus CNY,
+# plus "All" for events that apply broadly rather than to one currency
+# (e.g. OPEC meetings). Confirmed directly by scanning several months of
+# the live calendar, not guessed; this is a small, stable set compared to
+# investing.com's 107 countries because Forex Factory only covers
+# currencies with major FX pairs, not every country's own data releases.
+CURRENCY_NAMES = {
+    "USD": "US Dollar",
+    "EUR": "Euro",
+    "GBP": "British Pound",
+    "JPY": "Japanese Yen",
+    "AUD": "Australian Dollar",
+    "NZD": "New Zealand Dollar",
+    "CAD": "Canadian Dollar",
+    "CHF": "Swiss Franc",
+    "CNY": "Chinese Yuan",
+    "All": "All Currencies (Global Events)",
 }
 
-# Event categories investing.com's economic calendar widget supports, scraped
-# the same way as COUNTRY_NAMES from investing.com's own widget customization
-# tool -- each category checkbox's `id` attribute is its code. There are two
-# more the tool exposes (_confidenceIndex, _balance) that aren't included
-# here; DEFAULT_FILTERS below matches the original 6-category selection this
-# API shipped with, not "all of them".
-CATEGORY_NAMES = {
-    "_employment": "Employment",
-    "_economicActivity": "Economic Activity",
-    "_inflation": "Inflation",
-    "_credit": "Credit",
-    "_centralBanks": "Central Banks",
-    "_confidenceIndex": "Confidence Index",
-    "_balance": "Balance",
-    "_Bonds": "Bonds",
-}
-
-# Per-event data fields the ESP32 can choose to show. These map directly to
-# investing.com's own `columns` query param names, minus exc_flags/exc_currency
-# (see ALWAYS_REQUESTED_COLUMNS above -- neither is user-choosable: one is
-# structurally required, the other is never displayed). Turning one of these
-# off just means investing.com omits that cell from the HTML and the
-# corresponding JSON field comes back as "" (or impact_level 0/"unknown" for
-# exc_importance) -- parsing already handles a missing cell gracefully.
+# Per-event data fields the ESP32 can choose to display. Unlike
+# investing.com, Forex Factory has no request-level toggle for these --
+# impact/actual/forecast/previous are always present in the scraped HTML
+# for every event, so this is purely a display filter applied after
+# parsing (see apply_column_filter()), not something that changes what's
+# requested upstream.
 COLUMN_NAMES = {
-    "exc_importance": "Impact",
-    "exc_actual": "Actual",
-    "exc_forecast": "Forecast",
-    "exc_previous": "Previous",
+    "impact": "Impact",
+    "actual": "Actual",
+    "forecast": "Forecast",
+    "previous": "Previous",
 }
 
 
 class FiltersUpdate(BaseModel):
     importance: list[int]
-    countries: list[int]
-    categories: list[str]
+    currencies: list[str]
     columns: list[str]
 
     @field_validator("importance")
     @classmethod
     def validate_importance(cls, value):
-        if not value or any(level not in (1, 2, 3) for level in value):
-            raise ValueError("importance must be a non-empty list containing only 1, 2, and/or 3")
+        if not value or any(level not in (0, 1, 2, 3) for level in value):
+            raise ValueError("importance must be a non-empty list containing only 0 (holiday), 1, 2, and/or 3")
         return value
 
-    @field_validator("countries")
+    @field_validator("currencies")
     @classmethod
-    def validate_countries(cls, value):
-        if not value or any(code not in COUNTRY_NAMES for code in value):
-            raise ValueError("countries must be a non-empty list of codes from GET /countries")
-        return value
-
-    @field_validator("categories")
-    @classmethod
-    def validate_categories(cls, value):
-        if not value or any(code not in CATEGORY_NAMES for code in value):
-            raise ValueError("categories must be a non-empty list of codes from GET /categories")
+    def validate_currencies(cls, value):
+        if not value or any(code not in CURRENCY_NAMES for code in value):
+            raise ValueError("currencies must be a non-empty list of codes from GET /currencies")
         return value
 
     @field_validator("columns")
@@ -195,14 +156,23 @@ def load_filters() -> dict:
     try:
         with FILTERS_PATH.open("r", encoding="utf-8") as f:
             data = json.load(f)
+        if "currencies" not in data:
+            # Pre-Forex-Factory filters.json (investing.com's schema: numeric
+            # "countries" instead of "currencies", plus a "categories" concept
+            # Forex Factory doesn't have). There's no sane field-by-field
+            # migration for this -- a country code doesn't map onto a
+            # currency code -- so this resets to fresh defaults instead of
+            # guessing at one.
+            log.warning("%s predates the Forex Factory switch -- resetting to defaults", FILTERS_PATH)
+            save_filters(DEFAULT_FILTERS)
+            return dict(DEFAULT_FILTERS)
         # .get() with a default rather than data[...]: an existing
-        # filters.json from before categories/columns existed won't have
-        # those keys yet -- fall back to defaults for just those, instead of
-        # treating the whole file as corrupt.
+        # filters.json from before `columns` existed won't have that key yet
+        # -- fall back to the default for just that, instead of treating the
+        # whole file as corrupt.
         return {
             "importance": data.get("importance", DEFAULT_FILTERS["importance"]),
-            "countries": data.get("countries", DEFAULT_FILTERS["countries"]),
-            "categories": data.get("categories", DEFAULT_FILTERS["categories"]),
+            "currencies": data.get("currencies", DEFAULT_FILTERS["currencies"]),
             "columns": data.get("columns", DEFAULT_FILTERS["columns"]),
         }
     except (json.JSONDecodeError, OSError) as e:
@@ -214,123 +184,134 @@ def save_filters(filters: dict) -> None:
     with FILTERS_PATH.open("w", encoding="utf-8") as f:
         json.dump(filters, f)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-}
-
-# Selectors -- based on the widget's known table structure. If scraping
-# breaks, these are the first things to re-check against the live page.
-WIDGET_TABLE_ID = "ecEventsTable"
-EVENT_ROW_ID_SUBSTR = "eventRowId"
-
-IMPACT_LABELS = {1: "low", 2: "medium", 3: "high"}
-
-# Maps the sentiment cell's title attribute (e.g. "High Volatility
-# Expected") to an impact level. Primary signal for impact detection --
-# semantic text, less likely to silently break than the icon class names
-# below, which already have (as of 2026-07): investing.com renders them as
-# lowercase "grayFullBullishIcon"/"grayEmptyBullishIcon", not the ucfirst
-# "GrayFullBullish" this scraper originally assumed. Confirmed by fetching
-# the live page and inspecting the actual markup, not guessed.
-IMPACT_TITLE_KEYWORDS = {
-    "low": 1,
-    "moderate": 2,
-    "high": 3,
-}
 
 # --- Scraping logic ------------------------------------------------------
 
-def fetch_calendar_html(cal_type: str) -> str:
-    filters = load_filters()
-    params = dict(DEFAULT_PARAMS)
-    params["importance"] = ",".join(str(level) for level in filters["importance"])
-    params["countries"] = ",".join(str(code) for code in filters["countries"])
-    params["category"] = ",".join(filters["categories"])
-    params["columns"] = ALWAYS_REQUESTED_COLUMNS + "," + ",".join(filters["columns"])
-    params["calType"] = cal_type  # "day" or "week"
+# Selectors -- based on the calendar's known table structure. If scraping
+# breaks, these are the first things to re-check against the live page.
+WIDGET_TABLE_CLASS = "calendar__table"
 
-    # investing.com sits behind Cloudflare bot management, which blocks on
-    # TLS/HTTP client fingerprint rather than headers -- a stock `requests`
-    # call gets a 403 here even with a full browser header set. curl_cffi's
-    # impersonate="chrome" matches Chrome's actual TLS fingerprint, which is
-    # what actually gets past it.
+IMPACT_LABELS = {0: "holiday", 1: "low", 2: "medium", 3: "high"}
+
+# Maps the impact cell's icon class suffix to a level. Forex Factory doesn't
+# expose a semantic title/tooltip the way investing.com's sentiment cell
+# did (see git history for that scraper) -- the icon class is the only
+# signal available, so it's the first thing to re-check if impact detection
+# ever breaks. Confirmed directly by scanning several months of the live
+# calendar, not guessed.
+IMPACT_ICON_SUFFIX_LEVELS = {"gra": 0, "yel": 1, "ora": 2, "red": 3}
+
+
+def fetch_calendar_html(cal_type: str) -> str:
+    # Forex Factory accepts literal "today"/"this" aliases directly (verified
+    # directly) -- no need to compute or pass an actual date string.
+    param = "day=today" if cal_type == "day" else "week=this"
+
+    # Forex Factory doesn't sit behind Cloudflare bot management the way
+    # investing.com does -- a plain `requests` call gets a normal 200 here
+    # (verified directly). curl_cffi's impersonate="chrome" is kept anyway
+    # as cheap insurance against that changing later, not because it's
+    # currently required.
     resp = requests.get(
-        BASE_URL, params=params, headers=HEADERS, timeout=15, impersonate="chrome"
+        f"{BASE_URL}?{param}", headers=HEADERS, timeout=15, impersonate="chrome"
     )
     resp.raise_for_status()
     return resp.text
 
 
+def parse_impact_level(impact_cell) -> int:
+    """Impact level from the impact cell's icon class suffix -- see IMPACT_ICON_SUFFIX_LEVELS."""
+    if impact_cell is None:
+        return 0
+
+    # BeautifulSoup's class-filter callback is invoked once per individual
+    # class token AND once with the full space-joined string -- a lambda
+    # expecting a list here (e.g. `any(cls.startswith(...) for cls in c)`)
+    # silently iterates the wrong thing (characters of a string) on every
+    # call and never matches. A plain substring check on the (sometimes
+    # single-token, sometimes joined) string handles all of bs4's calls
+    # correctly -- verified directly, this exact gotcha broke the first
+    # version of this function.
+    icon = impact_cell.find("span", {"class": lambda c: c and "icon--ff-impact-" in c})
+    if icon is None:
+        return 0
+
+    for cls in icon.get("class", []):
+        if cls.startswith("icon--ff-impact-"):
+            suffix = cls[len("icon--ff-impact-"):]
+            return IMPACT_ICON_SUFFIX_LEVELS.get(suffix, 0)
+    return 0
+
+
 def parse_calendar(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table", {"id": WIDGET_TABLE_ID})
+    table = soup.find("table", {"class": WIDGET_TABLE_CLASS})
     if table is None:
         # Selector likely stale -- surface a clear error rather than
         # silently returning nothing.
         raise RuntimeError(
-            f"Could not find table#{WIDGET_TABLE_ID} in response -- "
-            "investing.com's markup may have changed. Check selectors."
+            f"Could not find table.{WIDGET_TABLE_CLASS} in response -- "
+            "Forex Factory's markup may have changed. Check selectors."
         )
 
-    # Day-separator rows (e.g. "Monday, July 27, 2026") aren't identified by
-    # an `id` -- only real event rows have one (containing
-    # EVENT_ROW_ID_SUBSTR) -- so they can't be picked out by the same
-    # `id`-based filter used below. Selecting all <tr> up front and checking
-    # each one's shape in the loop is the only way to see both.
     rows = table.find_all("tr")
     events = []
 
     current_day = None
+    current_time = ""
 
     for row in rows:
-        # The day-separator row is a single <td class="theDay" colspan="8">
-        # holding the date text -- the class lives on that cell, not on the
-        # <tr> itself (verified directly: the <tr> has no class or id of its
-        # own at all, so a previous version of this check, which looked for
-        # "theDay" in the *row's* class, could never match).
-        day_cell = row.find("td", {"class": "theDay"})
-        if day_cell is not None:
-            current_day = day_cell.get_text(strip=True)
+        classes = row.get("class") or []
+        if "calendar__row" not in classes:
+            # Header/subhead/borderfix rows -- not an event or day divider.
             continue
-
-        row_id = row.get("id") or ""
-        if EVENT_ROW_ID_SUBSTR not in row_id:
-            # Header row, and the hidden per-event "eventInfoNNN" detail rows
-            # (class noHover/displayNone) -- neither carries data we want.
+        if "calendar__row--day-breaker" in classes:
+            # Empty visual divider between days, no data of its own.
             continue
 
         try:
-            time_cell = row.find("td", {"class": "time"})
-            currency_cell = row.find("td", {"class": "flagCur"})
-            impact_cell = row.find("td", {"class": "sentiment"})
-            event_cell = row.find("td", {"class": "event"})
-            actual_cell = row.find("td", {"class": "act"})
-            forecast_cell = row.find("td", {"class": "fore"})
-            previous_cell = row.find("td", {"class": "prev"})
+            # The date cell is only populated on the first row of a new day
+            # (a "calendar__row--new-day" row) -- blank on every row after
+            # that for the same day, so the last non-blank value carries
+            # forward. Same story for the time cell within a day: blank on
+            # every row after the first at a given time (grouped same-time
+            # events aren't repeated).
+            date_cell = row.find("td", {"class": "calendar__date"})
+            if date_cell is not None:
+                day_text = date_cell.get_text(strip=True)
+                if day_text:
+                    current_day = day_text
+
+            time_cell = row.find("td", {"class": "calendar__time"})
+            if time_cell is not None:
+                time_text = time_cell.get_text(strip=True)
+                if time_text:
+                    current_time = time_text
+
+            currency_cell = row.find("td", {"class": "calendar__currency"})
+            impact_cell = row.find("td", {"class": "calendar__impact"})
+            event_cell = row.find("td", {"class": "calendar__event"})
+            actual_cell = row.find("td", {"class": "calendar__actual"})
+            forecast_cell = row.find("td", {"class": "calendar__forecast"})
+            previous_cell = row.find("td", {"class": "calendar__previous"})
 
             if event_cell is None:
                 continue
 
-            impact_level = parse_impact_level(impact_cell)
-            impact_label = IMPACT_LABELS.get(impact_level, "unknown")
+            event_title = event_cell.find("span", {"class": "calendar__event-title"})
+            name = event_title.get_text(strip=True) if event_title else event_cell.get_text(strip=True)
+            if not name:
+                continue
 
-            # The flag <span> inside this cell is decorative (just a CSS
-            # flag icon, no text) -- the currency code is a plain text node
-            # in the <td> alongside it, e.g. <td class="flagCur"><span
-            # class="ceFlags United_States"></span>USD</td>. Reading the
-            # span's own text (as this used to) always returned "".
-            currency = currency_cell.get_text(strip=True) if currency_cell else ""
+            impact_level = parse_impact_level(impact_cell)
 
             events.append({
                 "day": current_day,
-                "time": time_cell.get_text(strip=True) if time_cell else "",
-                "currency": currency,
-                "impact": impact_label,
+                "time": current_time,
+                "currency": currency_cell.get_text(strip=True) if currency_cell else "",
+                "impact": IMPACT_LABELS.get(impact_level, "unknown"),
                 "impact_level": impact_level,
-                "name": event_cell.get_text(strip=True),
+                "name": name,
                 "actual": actual_cell.get_text(strip=True) if actual_cell else "",
                 "forecast": forecast_cell.get_text(strip=True) if forecast_cell else "",
                 "previous": previous_cell.get_text(strip=True) if previous_cell else "",
@@ -343,24 +324,24 @@ def parse_calendar(html: str) -> list[dict]:
     return events
 
 
-def parse_impact_level(impact_cell) -> int:
+def apply_column_filter(events: list[dict], columns: list[str]) -> list[dict]:
     """
-    Impact level from the sentiment cell: title text first ("High/Moderate/Low
-    Volatility Expected"), falling back to counting filled bull icons if the
-    title's ever missing. See IMPACT_TITLE_KEYWORDS for why title is primary.
+    Blank out fields the user's `columns` selection excludes. Applied after
+    parsing/importance-and-currency filtering, since impact_level is needed
+    for importance filtering regardless of whether "impact" itself ends up
+    excluded from the response.
     """
-    if impact_cell is None:
-        return 0
-
-    title = (impact_cell.get("title") or "").lower()
-    for keyword, level in IMPACT_TITLE_KEYWORDS.items():
-        if keyword in title:
-            return level
-
-    filled = impact_cell.find_all(
-        "i", {"class": lambda c: c and "grayfullbullish" in c.lower()}
-    )
-    return len(filled) if filled else 0
+    for event in events:
+        if "impact" not in columns:
+            event["impact"] = "unknown"
+            event["impact_level"] = 0
+        if "actual" not in columns:
+            event["actual"] = ""
+        if "forecast" not in columns:
+            event["forecast"] = ""
+        if "previous" not in columns:
+            event["previous"] = ""
+    return events
 
 
 # --- API endpoints ---------------------------------------------------------
@@ -376,6 +357,8 @@ def get_calendar(range: str = Query("week", pattern="^(day|week)$")):
     range=day  -> today's events only
     range=week -> this week's events (default)
     """
+    filters = load_filters()
+
     try:
         html = fetch_calendar_html(range)
         events = parse_calendar(html)
@@ -385,6 +368,16 @@ def get_calendar(range: str = Query("week", pattern="^(day|week)$")):
     except RuntimeError as e:
         log.error("Parse failed: %s", e)
         raise HTTPException(status_code=502, detail=str(e))
+
+    # Forex Factory has no server-side filtering by impact/currency the way
+    # investing.com's importance=/countries= params did -- day/week is the
+    # only thing its own URL controls. Importance/currency selection is
+    # applied here instead, after scraping the full unfiltered response.
+    events = [
+        e for e in events
+        if e["impact_level"] in filters["importance"] and e["currency"] in filters["currencies"]
+    ]
+    events = apply_column_filter(events, filters["columns"])
 
     return JSONResponse({
         "range": range,
@@ -403,8 +396,7 @@ def get_filters():
 def update_filters(filters: FiltersUpdate):
     data = {
         "importance": filters.importance,
-        "countries": filters.countries,
-        "categories": filters.categories,
+        "currencies": filters.currencies,
         "columns": filters.columns,
     }
     save_filters(data)
@@ -412,17 +404,12 @@ def update_filters(filters: FiltersUpdate):
     return data
 
 
-@app.get("/countries")
-def get_countries():
+@app.get("/currencies")
+def get_currencies():
     return [
         {"code": code, "name": name}
-        for code, name in sorted(COUNTRY_NAMES.items(), key=lambda item: item[1])
+        for code, name in sorted(CURRENCY_NAMES.items(), key=lambda item: item[1])
     ]
-
-
-@app.get("/categories")
-def get_categories():
-    return [{"code": code, "name": name} for code, name in CATEGORY_NAMES.items()]
 
 
 @app.get("/columns")
