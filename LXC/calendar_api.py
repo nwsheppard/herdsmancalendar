@@ -50,28 +50,39 @@ app = FastAPI(title="Herdsman Trading Terminal Calendar API", lifespan=lifespan)
 
 BASE_URL = "https://sslecal2.investing.com/"
 
-# importance/countries are no longer static here -- they're loaded from
-# FILTERS_PATH (see load_filters()) so each deployment can configure its own
-# selection via GET/POST /filters instead of a firmware/code change.
-# columns/features/lang/timeZone are display prefs for investing.com's own
-# rendering -- harmless to keep even though we're parsing the HTML ourselves.
-#
-# exc_flags/exc_currency are kept in `columns` even though the ESP32 UI
-# doesn't ask for them explicitly: dropping them removes the currency-flag
-# cell from the HTML entirely, which breaks the currency field below
-# (verified directly -- not a guess).
+# importance/countries/categories/columns are no longer static here --
+# they're loaded from FILTERS_PATH (see load_filters()) so each deployment
+# can configure its own selection via GET/POST /filters instead of a
+# firmware/code change. features/lang/timeZone are display prefs for
+# investing.com's own rendering -- harmless to keep even though we're
+# parsing the HTML ourselves.
 DEFAULT_PARAMS = {
-    "columns": "exc_flags,exc_currency,exc_importance,exc_actual,exc_forecast,exc_previous",
-    "category": "_employment,_economicActivity,_inflation,_credit,_centralBanks,_Bonds",
     "features": "datepicker,timezone",
     "timeZone": "8",
     "lang": "1",
 }
 
+# exc_currency is always requested regardless of the user's `columns`
+# selection: dropping it doesn't just blank the currency field, it corrupts
+# the row's HTML entirely (verified directly) -- investing.com omits the
+# flagCur cell's closing </td>, so every later cell in that row (event,
+# actual, forecast, previous) ends up nested inside it instead of being a
+# sibling. exc_flags is the (never-displayed) flag icon and is never
+# requested -- dropping it is safe and there's no reason to ask for it.
+ALWAYS_REQUESTED_COLUMNS = "exc_currency"
+
 # --- Filters (impact level + countries), user-configurable via /filters ----
 
 FILTERS_PATH = Path(__file__).parent / "filters.json"
-DEFAULT_FILTERS = {"importance": [2, 3], "countries": [5]}
+DEFAULT_FILTERS = {
+    "importance": [2, 3],
+    "countries": [5],
+    "categories": [
+        "_employment", "_economicActivity", "_inflation",
+        "_credit", "_centralBanks", "_Bonds",
+    ],
+    "columns": ["exc_importance", "exc_actual", "exc_forecast", "exc_previous"],
+}
 
 # Every country investing.com's economic calendar widget supports, scraped
 # directly from investing.com's own widget customization tool
@@ -110,10 +121,43 @@ COUNTRY_NAMES = {
     247: "Montenegro",
 }
 
+# Event categories investing.com's economic calendar widget supports, scraped
+# the same way as COUNTRY_NAMES from investing.com's own widget customization
+# tool -- each category checkbox's `id` attribute is its code. There are two
+# more the tool exposes (_confidenceIndex, _balance) that aren't included
+# here; DEFAULT_FILTERS below matches the original 6-category selection this
+# API shipped with, not "all of them".
+CATEGORY_NAMES = {
+    "_employment": "Employment",
+    "_economicActivity": "Economic Activity",
+    "_inflation": "Inflation",
+    "_credit": "Credit",
+    "_centralBanks": "Central Banks",
+    "_confidenceIndex": "Confidence Index",
+    "_balance": "Balance",
+    "_Bonds": "Bonds",
+}
+
+# Per-event data fields the ESP32 can choose to show. These map directly to
+# investing.com's own `columns` query param names, minus exc_flags/exc_currency
+# (see ALWAYS_REQUESTED_COLUMNS above -- neither is user-choosable: one is
+# structurally required, the other is never displayed). Turning one of these
+# off just means investing.com omits that cell from the HTML and the
+# corresponding JSON field comes back as "" (or impact_level 0/"unknown" for
+# exc_importance) -- parsing already handles a missing cell gracefully.
+COLUMN_NAMES = {
+    "exc_importance": "Impact",
+    "exc_actual": "Actual",
+    "exc_forecast": "Forecast",
+    "exc_previous": "Previous",
+}
+
 
 class FiltersUpdate(BaseModel):
     importance: list[int]
     countries: list[int]
+    categories: list[str]
+    columns: list[str]
 
     @field_validator("importance")
     @classmethod
@@ -129,6 +173,20 @@ class FiltersUpdate(BaseModel):
             raise ValueError("countries must be a non-empty list of codes from GET /countries")
         return value
 
+    @field_validator("categories")
+    @classmethod
+    def validate_categories(cls, value):
+        if not value or any(code not in CATEGORY_NAMES for code in value):
+            raise ValueError("categories must be a non-empty list of codes from GET /categories")
+        return value
+
+    @field_validator("columns")
+    @classmethod
+    def validate_columns(cls, value):
+        if not value or any(code not in COLUMN_NAMES for code in value):
+            raise ValueError("columns must be a non-empty list of codes from GET /columns")
+        return value
+
 
 def load_filters() -> dict:
     if not FILTERS_PATH.exists():
@@ -137,8 +195,17 @@ def load_filters() -> dict:
     try:
         with FILTERS_PATH.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        return {"importance": data["importance"], "countries": data["countries"]}
-    except (json.JSONDecodeError, KeyError, OSError) as e:
+        # .get() with a default rather than data[...]: an existing
+        # filters.json from before categories/columns existed won't have
+        # those keys yet -- fall back to defaults for just those, instead of
+        # treating the whole file as corrupt.
+        return {
+            "importance": data.get("importance", DEFAULT_FILTERS["importance"]),
+            "countries": data.get("countries", DEFAULT_FILTERS["countries"]),
+            "categories": data.get("categories", DEFAULT_FILTERS["categories"]),
+            "columns": data.get("columns", DEFAULT_FILTERS["columns"]),
+        }
+    except (json.JSONDecodeError, OSError) as e:
         log.warning("Failed to read %s (%s) -- falling back to defaults", FILTERS_PATH, e)
         return dict(DEFAULT_FILTERS)
 
@@ -181,6 +248,8 @@ def fetch_calendar_html(cal_type: str) -> str:
     params = dict(DEFAULT_PARAMS)
     params["importance"] = ",".join(str(level) for level in filters["importance"])
     params["countries"] = ",".join(str(code) for code in filters["countries"])
+    params["category"] = ",".join(filters["categories"])
+    params["columns"] = ALWAYS_REQUESTED_COLUMNS + "," + ",".join(filters["columns"])
     params["calType"] = cal_type  # "day" or "week"
 
     # investing.com sits behind Cloudflare bot management, which blocks on
@@ -318,7 +387,12 @@ def get_filters():
 
 @app.post("/filters")
 def update_filters(filters: FiltersUpdate):
-    data = {"importance": filters.importance, "countries": filters.countries}
+    data = {
+        "importance": filters.importance,
+        "countries": filters.countries,
+        "categories": filters.categories,
+        "columns": filters.columns,
+    }
     save_filters(data)
     log.info("Filters updated: %s", data)
     return data
@@ -330,6 +404,16 @@ def get_countries():
         {"code": code, "name": name}
         for code, name in sorted(COUNTRY_NAMES.items(), key=lambda item: item[1])
     ]
+
+
+@app.get("/categories")
+def get_categories():
+    return [{"code": code, "name": name} for code, name in CATEGORY_NAMES.items()]
+
+
+@app.get("/columns")
+def get_columns():
+    return [{"code": code, "name": name} for code, name in COLUMN_NAMES.items()]
 
 
 if __name__ == "__main__":

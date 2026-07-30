@@ -58,24 +58,30 @@ curl http://<container-ip>:8080/calendar?range=day
 curl http://<container-ip>:8080/calendar?range=week
 ```
 
-## Filters: impact level + country
+## Filters: impact level, country, category, and columns
 
-`importance` (which impact levels to show) and `countries` (which
-countries) aren't fixed in code — they live in `filters.json`, created next
-to `calendar_api.py` with defaults of `{"importance": [2, 3], "countries":
-[5]}` (medium/high impact, US only) the moment the service starts (a
-FastAPI `lifespan` hook calls `load_filters()` on startup) — not lazily on
-the first `/calendar` or `/filters` request, which is surprising to find
-missing if you go looking for it right after `systemctl start`/`update`.
-This file survives `update` redeploys, since those only overwrite
-`calendar_api.py`/`requirements.txt`.
+`importance` (which impact levels to show), `countries` (which countries),
+`categories` (which investing.com event categories, e.g. Employment,
+Inflation, Central Banks), and `columns` (which optional per-event fields --
+Impact/Actual/Forecast/Previous -- to include) aren't fixed in code — they
+live in `filters.json`, created next to `calendar_api.py` with defaults of
+`{"importance": [2, 3], "countries": [5], "categories": ["_employment",
+"_economicActivity", "_inflation", "_credit", "_centralBanks", "_Bonds"],
+"columns": ["exc_importance", "exc_actual", "exc_forecast",
+"exc_previous"]}` the moment the service starts (a FastAPI `lifespan` hook
+calls `load_filters()` on startup) — not lazily on the first `/calendar` or
+`/filters` request, which is surprising to find missing if you go looking
+for it right after `systemctl start`/`update`. This file survives `update`
+redeploys, since those only overwrite `calendar_api.py`/`requirements.txt`.
+Loading an older `filters.json` that predates `categories`/`columns` falls
+back to those same defaults for just the missing keys.
 
 This makes each deployment independently configurable — useful since
 different customers of the same product want different things (some want
-low-impact events too, some want UK/China alongside the US, etc.) without
-needing a per-customer server config or code change. The ESP32's Settings
-screen is the intended way to change this day-to-day; the endpoints below
-are what it calls.
+low-impact events too, some want UK/China alongside the US, some don't care
+about Forecast/Previous values, etc.) without needing a per-customer server
+config or code change. The ESP32's Settings screen is the intended way to
+change this day-to-day; the endpoints below are what it calls.
 
 ```bash
 # Current selection
@@ -84,19 +90,36 @@ curl http://<container-ip>:8080/filters
 # All countries investing.com's widget supports, for building a picker UI
 curl http://<container-ip>:8080/countries
 
+# All event categories investing.com's widget supports
+curl http://<container-ip>:8080/categories
+
+# All optional per-event columns the ESP32 can choose to show
+curl http://<container-ip>:8080/columns
+
 # Update the selection (validated: importance must be 1/2/3, countries must
-# be codes from GET /countries -- an invalid request leaves the previously
-# saved filters untouched rather than partially applying)
+# be codes from GET /countries, categories from GET /categories, columns
+# from GET /columns -- an invalid request leaves the previously saved
+# filters untouched rather than partially applying)
 curl -X POST http://<container-ip>:8080/filters \
   -H "Content-Type: application/json" \
-  -d '{"importance": [1, 2, 3], "countries": [5, 4, 37]}'
+  -d '{"importance": [1, 2, 3], "countries": [5, 4, 37],
+       "categories": ["_employment", "_inflation"], "columns": ["exc_actual"]}'
 ```
 
-Country codes (`GET /countries`) were scraped directly from investing.com's
-own widget customization tool
-(`investing.com/webmaster-tools/economic-calendar`, each country checkbox's
+Country codes (`GET /countries`) and category codes (`GET /categories`)
+were both scraped directly from investing.com's own widget customization
+tool (`investing.com/webmaster-tools/economic-calendar`, each checkbox's
 `id` attribute is its code) — not a third-party or guessed list. If a code
 is ever suspected stale, that page is the source to re-check.
+
+`columns` intentionally excludes `exc_flags`/`exc_currency` from the
+choosable set -- `exc_currency` is always requested regardless of the
+saved selection, because dropping it doesn't just blank the currency field:
+investing.com's HTML omits the `flagCur` cell's closing `</td>` entirely,
+so every later cell in that row (event/actual/forecast/previous) ends up
+nested inside it instead of being a sibling, corrupting the whole row
+(verified directly, not a guess). `exc_flags` is the flag icon, which
+nothing here ever reads, so it's never requested at all.
 
 ## Maintenance notes
 
