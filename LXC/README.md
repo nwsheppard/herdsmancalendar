@@ -58,10 +58,57 @@ curl http://<container-ip>:8080/calendar?range=day
 curl http://<container-ip>:8080/calendar?range=week
 ```
 
+## Filters: impact level + country
+
+`importance` (which impact levels to show) and `countries` (which
+countries) aren't fixed in code — they live in `filters.json`, created next
+to `calendar_api.py` on first run with defaults of `{"importance": [2, 3],
+"countries": [5]}` (medium/high impact, US only). This survives `update`
+redeploys, since those only overwrite `calendar_api.py`/`requirements.txt`.
+
+This makes each deployment independently configurable — useful since
+different customers of the same product want different things (some want
+low-impact events too, some want UK/China alongside the US, etc.) without
+needing a per-customer server config or code change. The ESP32's Settings
+screen is the intended way to change this day-to-day; the endpoints below
+are what it calls.
+
+```bash
+# Current selection
+curl http://<container-ip>:8080/filters
+
+# All countries investing.com's widget supports, for building a picker UI
+curl http://<container-ip>:8080/countries
+
+# Update the selection (validated: importance must be 1/2/3, countries must
+# be codes from GET /countries -- an invalid request leaves the previously
+# saved filters untouched rather than partially applying)
+curl -X POST http://<container-ip>:8080/filters \
+  -H "Content-Type: application/json" \
+  -d '{"importance": [1, 2, 3], "countries": [5, 4, 37]}'
+```
+
+Country codes (`GET /countries`) were scraped directly from investing.com's
+own widget customization tool
+(`investing.com/webmaster-tools/economic-calendar`, each country checkbox's
+`id` attribute is its code) — not a third-party or guessed list. If a code
+is ever suspected stale, that page is the source to re-check.
+
 ## Maintenance notes
 
-- investing.com can change its HTML structure, so this service may need periodic selector updates.
-- The current `countries` and `importance` values are simple defaults and may be adjusted later.
+- investing.com can change its HTML structure, so this service may need
+  periodic selector updates. This already happened once: as of 2026-07,
+  the impact-level icon classes changed from `GrayFullBullish` to
+  lowercase `grayFullBullishIcon`/`grayEmptyBullishIcon`, silently breaking
+  impact detection (every event came back `impact_level: 0`/`"unknown"`).
+  Fixed by reading the sentiment cell's `title` attribute ("High/Moderate/Low
+  Volatility Expected") as the primary signal instead, with icon-counting
+  as a fallback — semantic text is less likely to silently drift than a
+  CSS class name. If impact detection breaks again, check `title` first.
+- `columns` must keep `exc_flags,exc_currency` even though nothing in the
+  UI displays the flag icon — dropping them removes the currency-code cell
+  from the HTML entirely, not just the visual flag. Confirmed directly by
+  fetching the page with and without them.
 - A cache layer would be a good next step if the API is polled frequently.
 
 ## License
