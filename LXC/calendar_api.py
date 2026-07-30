@@ -219,6 +219,39 @@ def fetch_calendar_html(cal_type: str) -> str:
     return resp.text
 
 
+def parse_value_state(cell) -> str:
+    """
+    "better"/"worse"/"neutral" from a value cell's wrapper <span> class --
+    Forex Factory pre-computes this itself (accounting for which direction
+    is actually "good" for a given indicator, e.g. higher unemployment is
+    bad but higher GDP is good), so this reads their judgment rather than
+    guessing one from the raw numbers. Confirmed directly against
+    forexfactory.com's own stylesheet: `.better{color:#090}`,
+    `.worse{color:#c00}`. Used for both `actual` (vs forecast) and
+    `previous` (vs its originally-reported value, when revised) -- the
+    wrapper span's class shape is identical for both.
+    """
+    if cell is None:
+        return "neutral"
+    span = cell.find("span")
+    if span is None:
+        return "neutral"
+    classes = span.get("class") or []
+    if "worse" in classes:
+        return "worse"
+    if "better" in classes:
+        return "better"
+    return "neutral"
+
+
+def parse_previous_revised(previous_cell) -> bool:
+    """Whether this period's "previous" value was revised from what was originally reported last time."""
+    if previous_cell is None:
+        return False
+    span = previous_cell.find("span")
+    return span is not None and "revised" in (span.get("class") or [])
+
+
 def parse_impact_level(impact_cell) -> int:
     """Impact level from the impact cell's icon class suffix -- see IMPACT_ICON_SUFFIX_LEVELS."""
     if impact_cell is None:
@@ -305,7 +338,15 @@ def parse_calendar(html: str) -> list[dict]:
 
             impact_level = parse_impact_level(impact_cell)
 
+            # Forex Factory's own stable per-event ID (data-event-id on the
+            # row) -- lets the ESP32 track "have I already alerted/refreshed
+            # for this specific event" across repeated fetches, instead of
+            # matching on name+time (fragile: not unique, and both are
+            # display strings that could shift between requests).
+            event_id = int(row.get("data-event-id", 0) or 0)
+
             events.append({
+                "id": event_id,
                 "day": current_day,
                 "time": current_time,
                 "currency": currency_cell.get_text(strip=True) if currency_cell else "",
@@ -313,8 +354,11 @@ def parse_calendar(html: str) -> list[dict]:
                 "impact_level": impact_level,
                 "name": name,
                 "actual": actual_cell.get_text(strip=True) if actual_cell else "",
+                "actual_state": parse_value_state(actual_cell),
                 "forecast": forecast_cell.get_text(strip=True) if forecast_cell else "",
                 "previous": previous_cell.get_text(strip=True) if previous_cell else "",
+                "previous_state": parse_value_state(previous_cell),
+                "previous_revised": parse_previous_revised(previous_cell),
             })
         except Exception as e:
             # Don't let one malformed row kill the whole response.
@@ -337,10 +381,13 @@ def apply_column_filter(events: list[dict], columns: list[str]) -> list[dict]:
             event["impact_level"] = 0
         if "actual" not in columns:
             event["actual"] = ""
+            event["actual_state"] = "neutral"
         if "forecast" not in columns:
             event["forecast"] = ""
         if "previous" not in columns:
             event["previous"] = ""
+            event["previous_state"] = "neutral"
+            event["previous_revised"] = False
     return events
 
 

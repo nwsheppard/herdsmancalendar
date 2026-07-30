@@ -153,6 +153,35 @@ several months of the live calendar, not guessed or pulled from a
 third-party list -- Forex Factory doesn't publish this set anywhere else,
 so re-scan the live site if a new currency is ever suspected.
 
+## `/calendar` event shape: stable IDs and actual/previous value coloring
+
+Beyond the fields already covered above (`day`/`time`/`currency`/`impact`/
+`impact_level`/`name`/`actual`/`forecast`/`previous`), each event also
+carries:
+
+- `id` -- Forex Factory's own stable per-event ID (the `data-event-id`
+  attribute already present on every event's `<tr>`). Lets a client track
+  "have I already alerted/refreshed for this specific event" across
+  repeated fetches without matching on name+time (fragile: neither is
+  guaranteed unique, and both can shift between requests).
+- `actual_state` / `previous_state` -- `"better"`, `"worse"`, or
+  `"neutral"`. Forex Factory pre-computes this itself (accounting for
+  which direction is actually good for a given indicator -- higher
+  unemployment is bad, higher GDP is good -- something this scraper has no
+  way to know per-indicator on its own) and marks it via a wrapper `<span>`
+  class on the `actual`/`previous` cells; this just reads that judgment
+  rather than deriving one from the raw numbers. Colors match
+  forexfactory.com's own stylesheet exactly, confirmed directly:
+  `.better{color:#090}`, `.worse{color:#c00}`.
+- `previous_revised` -- whether this period's `previous` value was revised
+  from what was originally reported last time (a separate `<span>` class,
+  independent of worse/better -- a revision can be neutral, better, or
+  worse).
+
+All three reset to their neutral defaults when `columns` excludes `actual`/
+`previous` (`apply_column_filter()`), consistent with those fields
+themselves being blanked.
+
 ## Maintenance notes
 
 - forexfactory.com can change its HTML structure, so this service may need
