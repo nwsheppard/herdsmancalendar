@@ -25,13 +25,26 @@ from curl_cffi import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 from pathlib import Path
+from contextlib import asynccontextmanager
 import json
 import logging
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("calendar_api")
 
-app = FastAPI(title="Herdsman Trading Terminal Calendar API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Without this, filters.json only gets created the first time something
+    # calls load_filters() -- i.e. the first /calendar or /filters request,
+    # not when the service actually starts. That's surprising for anyone
+    # restarting/updating the service and checking for the file right after
+    # (nothing to look at yet, no filters set, no obvious reason why).
+    load_filters()
+    yield
+
+
+app = FastAPI(title="Herdsman Trading Terminal Calendar API", lifespan=lifespan)
 
 # --- Configuration -----------------------------------------------------
 

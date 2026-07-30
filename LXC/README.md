@@ -62,9 +62,13 @@ curl http://<container-ip>:8080/calendar?range=week
 
 `importance` (which impact levels to show) and `countries` (which
 countries) aren't fixed in code — they live in `filters.json`, created next
-to `calendar_api.py` on first run with defaults of `{"importance": [2, 3],
-"countries": [5]}` (medium/high impact, US only). This survives `update`
-redeploys, since those only overwrite `calendar_api.py`/`requirements.txt`.
+to `calendar_api.py` with defaults of `{"importance": [2, 3], "countries":
+[5]}` (medium/high impact, US only) the moment the service starts (a
+FastAPI `lifespan` hook calls `load_filters()` on startup) — not lazily on
+the first `/calendar` or `/filters` request, which is surprising to find
+missing if you go looking for it right after `systemctl start`/`update`.
+This file survives `update` redeploys, since those only overwrite
+`calendar_api.py`/`requirements.txt`.
 
 This makes each deployment independently configurable — useful since
 different customers of the same product want different things (some want
