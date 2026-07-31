@@ -51,6 +51,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 import json
 import logging
+import os
 import re
 
 logging.basicConfig(level=logging.INFO)
@@ -83,7 +84,17 @@ HEADERS = {
 
 # --- Filters (impact level + currencies), user-configurable via /filters ----
 
-FILTERS_PATH = Path(__file__).parent / "filters.json"
+# Defaults to sitting next to this file (the LXC install's own behavior,
+# unchanged) -- FILTERS_DIR only matters for the Docker image (see
+# Docker/Dockerfile), which sets it to a dedicated directory so the whole
+# directory can be volume-mounted for persistence across container
+# recreations. Deliberately a directory mount, not a single file mounted
+# directly onto filters.json: Docker creates a plain directory (not a
+# file) at a single-file mount target that doesn't already exist as a file
+# in the image, which would break FILTERS_PATH.open("w") the first time
+# this container tries to save filters with nothing pre-created there yet.
+FILTERS_DIR = Path(os.environ.get("FILTERS_DIR", str(Path(__file__).parent)))
+FILTERS_PATH = FILTERS_DIR / "filters.json"
 DEFAULT_FILTERS = {
     "importance": [2, 3],
     "currencies": ["USD"],

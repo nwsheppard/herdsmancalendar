@@ -1,0 +1,23 @@
+# Run from the repo root: docker compose -f Docker/docker-compose.yml up -d
+# (context: .. below means "repo root" -- this file lives in Docker/, one
+# level under it -- so this works regardless of your current directory as
+# long as the path to this file is correct.)
+services:
+  herdsman-calendar:
+    build:
+      context: ..
+      dockerfile: Docker/Dockerfile
+    image: herdsman-calendar:latest
+    container_name: herdsman-calendar
+    ports:
+      - "8080:8080"
+    volumes:
+      # Whole directory, not filters.json itself -- see the Dockerfile's
+      # FILTERS_DIR comment for why a single-file mount is the wrong move
+      # here. Survives `docker compose up --build`/image updates; only
+      # `docker volume rm` (or `down -v`) actually loses it.
+      - herdsman_data:/data
+    restart: unless-stopped
+
+volumes:
+  herdsman_data:

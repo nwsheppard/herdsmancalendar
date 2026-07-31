@@ -1,0 +1,20 @@
+# Named Dockerfile.dockerignore (not plain .dockerignore), colocated with
+# the Dockerfile it applies to -- Docker/BuildKit looks for a
+# "<dockerfile-name>.dockerignore" next to the Dockerfile first, before
+# falling back to a plain .dockerignore at the build context root. Build
+# context here is the repo root (see Dockerfile's header comment), so a
+# plain .dockerignore would have had to live there instead, one level
+# above where the rest of this project's Docker-specific files live -- this
+# naming keeps everything Docker-related inside this one folder.
+# If your Docker version predates this lookup (BuildKit, default since
+# Docker 23.0), copy this file's contents into a plain .dockerignore at the
+# repo root instead -- see Docker/README.md.
+.git
+.github
+.vscode
+.claude
+ESP32
+Drawings
+**/__pycache__
+**/*.pyc
+**/filters.json
