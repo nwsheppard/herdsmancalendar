@@ -44,13 +44,11 @@ void on_columns_clicked(lv_event_t *)
     settings_columns_screen_open(screen);
 }
 
-/** Menu buttons are bigger than theme_create_button()'s default -- bump the label font to match. */
+/** Menu buttons are just a bigger footprint than theme_create_button()'s default -- no font override needed. */
 lv_obj_t * make_menu_button(lv_obj_t * parent, const char * text, lv_event_cb_t callback)
 {
     lv_obj_t * button = theme_create_button(parent, text, callback);
     lv_obj_set_size(button, 360, 56);
-    lv_obj_t * label = lv_obj_get_child(button, 0);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
     return button;
 }
 
@@ -68,7 +66,7 @@ void settings_screen_open(lv_obj_t * previous_screen)
     lv_obj_t * title = lv_label_create(screen);
     lv_label_set_text(title, "SETTINGS");
     lv_obj_set_style_text_color(title, lv_color_hex(THEME_COLOR_AMBER), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_40, 0);
+    lv_obj_set_style_text_font(title, &lv_font_unscii_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
 
     lv_obj_t * wifi_btn = make_menu_button(screen, "WiFi", on_wifi_clicked);

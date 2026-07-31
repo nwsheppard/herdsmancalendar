@@ -2,7 +2,6 @@
 #include <time.h>
 
 #include "alert_manager.h"
-#include "audio_player.h"
 #include "calendar_view.h"
 
 namespace {
@@ -10,19 +9,27 @@ namespace {
 struct TimedEvent {
     long id;
     time_t timestamp;
-    int impact_level;
     String name;
 };
 
 std::vector<TimedEvent> timed_events;
 
 // Per-event-id "already done" tracking so a threshold staying crossed for
-// several ticks (the 5-minute alert window, or even the ~1-minute refresh
-// window) doesn't repeat the sound/refresh every single tick.
-std::vector<long> alerted_ids;
+// several ticks (the ~1-minute refresh window) doesn't repeat the refresh
+// every single tick.
 std::vector<long> refreshed_ids;
 
-String countdown_text;
+struct ActiveEvent {
+    long id;
+    long seconds_left;
+};
+
+// Every timed event currently within countdown_window_s, recomputed each
+// tick -- not just the single soonest, so simultaneous releases (several
+// events at the same scheduled time) all get a countdown, not just
+// whichever one the scan happens to see first.
+std::vector<ActiveEvent> active_events;
+
 uint32_t last_check_ms = 0;
 constexpr uint32_t check_interval_ms = 1000;
 
@@ -32,7 +39,6 @@ constexpr uint32_t check_interval_ms = 1000;
 long next_test_event_id = -1;
 
 constexpr long countdown_window_s = 10 * 60;
-constexpr long alert_window_s = 5 * 60;
 constexpr long refresh_delay_s = 30;
 // Upper bound on the refresh window: a tick lands close to once a second,
 // so without some slack a single check exactly at +30s could be missed
@@ -51,7 +57,7 @@ bool contains(const std::vector<long> & ids, long id)
 }
 
 /**
- * Parses CalendarEvent.day ("MonJul 27") + .time ("8:30am") into a real
+ * Parses CalendarEvent.day ("Fri Jul 27") + .time ("8:30am") into a real
  * timestamp. Returns false for events with no fixed time ("All Day",
  * "Tentative") -- there's nothing to count down to -- or if NTP hasn't
  * synced yet (the current year is needed to disambiguate the day text,
@@ -63,12 +69,16 @@ bool parse_event_timestamp(const CalendarEvent & event, time_t & out)
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     };
 
-    // Skip the 3-char weekday abbreviation glued to the front (e.g. "Mon"),
-    // leaving "Jul 27".
-    if (event.day.length() < 4) {
+    // Skip the weekday abbreviation (e.g. "Fri") up to its first space,
+    // leaving "Jul 27" -- calendar_api.py's day field used to glue the
+    // weekday directly onto the month with no separator ("FriJul 27", a
+    // BeautifulSoup get_text() quirk, fixed server-side), but a real space
+    // is more robust to parse than a hardcoded 3-char skip regardless.
+    const int weekday_space = event.day.indexOf(' ');
+    if (weekday_space < 0) {
         return false;
     }
-    const String month_and_day = event.day.substring(3);
+    const String month_and_day = event.day.substring(weekday_space + 1);
     const int space_index = month_and_day.indexOf(' ');
     if (space_index < 0) {
         return false;
@@ -155,12 +165,12 @@ void alert_manager_set_events(const std::vector<CalendarEvent> & events)
     for (const CalendarEvent & event : events) {
         time_t timestamp;
         if (parse_event_timestamp(event, timestamp)) {
-            timed_events.push_back({event.id, timestamp, event.impact_level, event.name});
+            timed_events.push_back({event.id, timestamp, event.name});
         }
     }
 }
 
-void alert_manager_inject_test_event(long seconds_from_now, int impact_level)
+void alert_manager_inject_test_event(long seconds_from_now, long reuse_event_id)
 {
     struct tm now_tm;
     if (!getLocalTime(&now_tm, 0)) {
@@ -169,11 +179,13 @@ void alert_manager_inject_test_event(long seconds_from_now, int impact_level)
     }
     const time_t now = mktime(&now_tm);
 
-    const TimedEvent test_event = {next_test_event_id--, now + seconds_from_now, impact_level, "TEST EVENT"};
+    const long id = reuse_event_id != 0 ? reuse_event_id : next_test_event_id--;
+    const TimedEvent test_event = {id, now + seconds_from_now, "TEST EVENT"};
     timed_events.push_back(test_event);
 
-    Serial.printf("Injected test event: id=%ld, %ld seconds from now, impact_level=%d\n",
-                  test_event.id, seconds_from_now, impact_level);
+    Serial.printf("Injected test event: id=%ld%s, %ld seconds from now\n", test_event.id,
+                  reuse_event_id != 0 ? " (reusing a real, displayed row)" : " (synthetic -- no row to highlight)",
+                  seconds_from_now);
 }
 
 void alert_manager_tick()
@@ -186,29 +198,18 @@ void alert_manager_tick()
 
     struct tm now_tm;
     if (!getLocalTime(&now_tm, 0)) {
-        countdown_text = ""; // time not synced yet -- nothing to responsibly show or act on
+        active_events.clear(); // time not synced yet -- nothing to responsibly show or act on
         return;
     }
     const time_t now = mktime(&now_tm);
 
-    bool have_soonest = false;
-    long soonest_seconds_left = 0;
-    String soonest_name;
+    active_events.clear();
 
     for (const TimedEvent & event : timed_events) {
         const long seconds_until = static_cast<long>(event.timestamp - now);
 
-        if (seconds_until > 0 && seconds_until <= countdown_window_s &&
-            (!have_soonest || seconds_until < soonest_seconds_left)) {
-            have_soonest = true;
-            soonest_seconds_left = seconds_until;
-            soonest_name = event.name;
-        }
-
-        if (seconds_until > 0 && seconds_until <= alert_window_s && event.impact_level == 3 &&
-            !contains(alerted_ids, event.id)) {
-            alerted_ids.push_back(event.id);
-            audio_player_play_alert();
+        if (seconds_until > 0 && seconds_until <= countdown_window_s) {
+            active_events.push_back({event.id, seconds_until});
         }
 
         const long seconds_since = -seconds_until;
@@ -218,18 +219,26 @@ void alert_manager_tick()
             calendar_view_refresh();
         }
     }
-
-    if (have_soonest) {
-        char buffer[96];
-        snprintf(buffer, sizeof(buffer), "NEXT: %s in %02ld:%02ld", soonest_name.c_str(),
-                 soonest_seconds_left / 60, soonest_seconds_left % 60);
-        countdown_text = buffer;
-    } else {
-        countdown_text = "";
-    }
 }
 
-String alert_manager_get_countdown_text()
+std::vector<long> alert_manager_get_active_event_ids()
 {
-    return countdown_text;
+    std::vector<long> ids;
+    ids.reserve(active_events.size());
+    for (const ActiveEvent & event : active_events) {
+        ids.push_back(event.id);
+    }
+    return ids;
+}
+
+String alert_manager_get_countdown_text_for(long event_id)
+{
+    for (const ActiveEvent & event : active_events) {
+        if (event.id == event_id) {
+            char buffer[16];
+            snprintf(buffer, sizeof(buffer), "%02ld:%02ld", event.seconds_left / 60, event.seconds_left % 60);
+            return buffer;
+        }
+    }
+    return "";
 }

@@ -6,6 +6,7 @@
 #include "calendar_model.h"
 #include "calendar_server_store.h"
 #include "calendar_view.h"
+#include "fonts.h"
 #include "settings_screen.h"
 #include "theme.h"
 
@@ -23,18 +24,171 @@ lv_obj_t * no_server_message = nullptr;
 lv_obj_t * day_tab_button = nullptr;
 lv_obj_t * week_tab_button = nullptr;
 lv_obj_t * list = nullptr;
+lv_obj_t * header = nullptr;
 lv_obj_t * status_label = nullptr;
-lv_obj_t * countdown_label = nullptr;
 
-// "week" matches calendar_api.py's own /calendar default.
-String current_range = "week";
+// Computed once in build_events_ui() from the WiFi icon's actual rendered
+// position (see its own comment there) and reused by every later header
+// rebuild in populate_events() -- the icon doesn't move at runtime, so
+// there's no need to re-measure it on every refresh.
+int16_t grid_width = 0;
 
+// Default launch screen is Day Events, not calendar_api.py's own /calendar
+// default ("week") -- a user preference, not a backend constraint.
+String current_range = "day";
+
+// Populated by refresh_events() alongside alert_manager_set_events() --
+// update_next_event_row() needs each event's plain scheduled time text to
+// restore a row that's no longer the countdown target (the row itself only
+// carries its event id, via lv_obj_user_data, not its original time text).
+std::vector<CalendarEvent> current_events;
+
+// One entry per row currently highlighted as an active countdown --
+// several at once whenever multiple events share (or nearly share) a
+// scheduled time, which is routine for a trading calendar (several
+// indicators dropping at the same 8:30am, for example), not an edge case
+// worth collapsing down to a single "next" event.
+struct HighlightedRow {
+    long id;
+    // Last "MM:SS" string actually written to this row's TIME label.
+    // calendar_view_tick() (and so update_next_event_row()) runs every
+    // loop() iteration, not just once a second -- alert_manager's own
+    // countdown values only actually change once a second internally, so
+    // without this guard lv_label_set_text() would still run on every
+    // single iteration with an unchanged string. Confirmed directly on
+    // hardware to matter: LVGL invalidates on every lv_label_set_text()
+    // call regardless of whether the text changed, and this display's
+    // LV_DISPLAY_RENDER_MODE_FULL means any invalidation forces a full
+    // 800x480 frame redraw/present -- ~66ms at this panel's configured
+    // pixel clock. Without this guard that ran on every loop() iteration
+    // (~15/s) for as long as a countdown was showing, not once a second as
+    // intended -- confirmed as the cause of the intermittent display
+    // "blips" reported from hardware.
+    String last_shown_countdown_text;
+};
+std::vector<HighlightedRow> highlighted_rows;
+
+bool contains_id(const std::vector<long> & ids, long id)
+{
+    for (long existing : ids) {
+        if (existing == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// TIME/CCY stay fixed -- neither varies enough row to row to be worth
+// measuring dynamically (TIME is always "H:MMam"-shaped or a short fixed
+// string like "Tentative"; CCY is always exactly a 3-letter code, or
+// hidden entirely -- see show_ccy in ColumnLayout below). ACT/FCST/PREV
+// don't have their own constants anymore -- see compute_column_layout().
 constexpr int16_t col_impact_w = 10;
-constexpr int16_t col_time_w = 70;
+constexpr int16_t col_time_w = 105;
 constexpr int16_t col_ccy_w = 55;
-constexpr int16_t col_act_w = 70;
-constexpr int16_t col_fcst_w = 70;
-constexpr int16_t col_prev_w = 70;
+
+// spacemono_18's advance width, in px -- confirmed from the generated
+// font's adv_w=176 (1/16px fixed-point), and it lands on a clean integer
+// (176/16 = 11 exactly), not a coincidence: lv_font_conv rounds advance
+// widths to whole 1/16px units, and this particular size happened to land
+// on a whole pixel.
+constexpr int16_t spacemono_18_char_w = 11;
+
+// Fallback widths for the header shown briefly before the first fetch
+// resolves (build_events_ui() renders one immediately so the screen isn't
+// blank while "Loading events..." shows) -- overwritten by
+// compute_column_layout()'s actual measurement the moment real data (or a
+// failed fetch) comes back. Sized generously since there's no real data
+// yet to measure against.
+constexpr int16_t col_act_w_fallback = 95;
+constexpr int16_t col_fcst_w_fallback = 95;
+constexpr int16_t col_prev_w_fallback = 100;
+
+/**
+ * ACT/FCST/PREV widths, and whether to show CCY at all, computed fresh
+ * for whatever's actually on screen -- not a fixed guess wide enough for
+ * a worst case that's rarely actually present. Maximizes room for EVENT,
+ * the column that actually benefits from it (long economic-indicator
+ * names), directly per the request that prompted this ("I want all the
+ * space that I can get for EVENT").
+ */
+struct ColumnLayout {
+    bool show_ccy = true;
+    int16_t act_w = col_act_w_fallback;
+    int16_t fcst_w = col_fcst_w_fallback;
+    int16_t prev_w = col_prev_w_fallback;
+};
+
+/**
+ * Measures the widest ACT/FCST/PREV value actually present in `events`
+ * (never narrower than that column's own header label, so "ACT"/"FCST"/
+ * "PREV" never themselves get clipped) and sizes each column to fit it
+ * plus a little padding, instead of a fixed width wide enough for a
+ * worst case ("Tentative" in TIME, an unusually wide number) that's
+ * rarely actually on screen at once.
+ */
+ColumnLayout compute_column_layout(const std::vector<CalendarEvent> & events, bool show_ccy)
+{
+    ColumnLayout layout;
+    layout.show_ccy = show_ccy;
+
+    size_t max_act_chars = 3;  // "ACT"
+    size_t max_fcst_chars = 4; // "FCST"
+    size_t max_prev_chars = 4; // "PREV"
+
+    for (const CalendarEvent & event : events) {
+        if (static_cast<size_t>(event.actual.length()) > max_act_chars) {
+            max_act_chars = static_cast<size_t>(event.actual.length());
+        }
+        if (static_cast<size_t>(event.forecast.length()) > max_fcst_chars) {
+            max_fcst_chars = static_cast<size_t>(event.forecast.length());
+        }
+        // +1 for the revision "*" suffix (see make_event_row()) -- a
+        // revised value one char longer than the widest plain one still
+        // needs to fit without ellipsizing.
+        size_t prev_chars = static_cast<size_t>(event.previous.length());
+        if (event.previous_revised) {
+            prev_chars += 1;
+        }
+        if (prev_chars > max_prev_chars) {
+            max_prev_chars = prev_chars;
+        }
+    }
+
+    // A little breathing room past the exact pixel measurement -- text
+    // sized to the exact width of its own content reads as cramped
+    // against its neighbors with zero margin.
+    constexpr int16_t column_padding_px = 10;
+    layout.act_w = static_cast<int16_t>(max_act_chars * spacemono_18_char_w + column_padding_px);
+    layout.fcst_w = static_cast<int16_t>(max_fcst_chars * spacemono_18_char_w + column_padding_px);
+    layout.prev_w = static_cast<int16_t>(max_prev_chars * spacemono_18_char_w + column_padding_px);
+    return layout;
+}
+
+// Anything above roughly a couple of frames' worth of time (60fps = ~16.6ms
+// each) is worth a log line -- the frame-shift hazard needs a stall long
+// enough to starve the RGB panel's bounce-buffer refill, not routine
+// per-frame variance.
+constexpr uint32_t stall_log_threshold_ms = 20;
+
+/**
+ * lv_timer_handler(), but logs to Serial (with an absolute timestamp) if a
+ * single call takes long enough to plausibly cause the frame-shift/pixelation
+ * glitch -- see the write-up in the README. Every call site in this file
+ * goes through this instead of the bare LVGL function, so a recurrence shows
+ * up in the serial log with when and during what, instead of just being a
+ * glitch nobody has a record of.
+ */
+void timed_timer_handler(const char * context)
+{
+    const uint32_t start_ms = millis();
+    lv_timer_handler();
+    const uint32_t elapsed_ms = millis() - start_ms;
+    if (elapsed_ms > stall_log_threshold_ms) {
+        Serial.printf("[stall] lv_timer_handler() took %lums during %s, ending t=%lums\n",
+                      static_cast<unsigned long>(elapsed_ms), context, static_cast<unsigned long>(millis()));
+    }
+}
 
 uint32_t impact_color_for(int level)
 {
@@ -93,30 +247,51 @@ void on_week_tab_clicked(lv_event_t *)
     refresh_events();
 }
 
-/** A thin day-separator label (e.g. "MonJul 27") between groups of events. */
+/** A thin day-separator label (e.g. "Mon Jul 27") between groups of events. */
 lv_obj_t * make_day_separator_row(lv_obj_t * parent, const String & day_text)
 {
     lv_obj_t * label = lv_label_create(parent);
     lv_label_set_text(label, day_text.c_str());
     lv_obj_set_style_text_color(label, lv_color_hex(THEME_COLOR_AMBER_DIM), 0);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    // Matches add_label()'s font below -- this label sits directly above
+    // the grid and should read at the same density.
+    lv_obj_set_style_text_font(label, &lv_font_spacemono_18, 0);
     lv_obj_set_style_pad_top(label, 8, 0);
     return label;
 }
 
-/** One fixed-width-column row; widths match make_header_row() so text lines up. */
-lv_obj_t * make_event_row(lv_obj_t * parent, const CalendarEvent & event)
+/**
+ * One row; ACT/FCST/PREV widths and whether CCY shows at all come from
+ * `layout` (see compute_column_layout()) so they match whatever
+ * rebuild_header_row() built for this same refresh.
+ *
+ * Row height is LV_SIZE_CONTENT, not a fixed pixel value -- EVENT now word-
+ * wraps (see add_label() below) instead of ellipsizing, so the row needs
+ * to grow to fit however many lines that takes rather than clip/overflow
+ * a fixed height. impact_bar's own fixed 40px height sets a sensible
+ * minimum for a single-line row (LVGL sizes a content-fit flex container
+ * to its tallest child); a row wrapping to 3+ lines simply grows taller
+ * than that, with impact_bar staying centered and its original size.
+ */
+lv_obj_t * make_event_row(lv_obj_t * parent, const CalendarEvent & event, const ColumnLayout & layout)
 {
     lv_obj_t * row = lv_obj_create(parent);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, LV_PCT(100), 56);
+    lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(THEME_COLOR_BACKGROUND), 0);
+    // Lets update_next_event_row() find this row again by event id later --
+    // day separator labels (make_day_separator_row()) are never tagged, so
+    // their default user_data of nullptr/0 doubles as "not an event row"
+    // (real Forex Factory ids and injected test event ids are never 0).
+    lv_obj_set_user_data(row, reinterpret_cast<void *>(static_cast<intptr_t>(event.id)));
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(row, 6, 0);
     lv_obj_set_style_pad_left(row, 6, 0);
     lv_obj_set_style_pad_right(row, 6, 0);
+    lv_obj_set_style_pad_top(row, 6, 0);
+    lv_obj_set_style_pad_bottom(row, 6, 0);
 
     lv_obj_t * impact_bar = lv_obj_create(row);
     lv_obj_remove_style_all(impact_bar);
@@ -125,16 +300,47 @@ lv_obj_t * make_event_row(lv_obj_t * parent, const CalendarEvent & event)
     lv_obj_set_style_bg_opa(impact_bar, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(impact_bar, 2, 0);
 
-    auto add_label = [row](const String & text, int16_t width, bool grow, uint32_t color) {
+    // LVGL's built-in unscii_8/_16 (see fonts.h) turned out to be an
+    // all-or-nothing choice for this dense a grid: _16's 16px/char advance
+    // blew through these fixed columns and wrapped rows (reported directly
+    // from hardware as "wraps the cells"), but _8's 8px line height was
+    // reported right back as too small to read comfortably. spacemono_18
+    // (see fonts.h) is a genuinely scalable font, so it splits the
+    // difference properly instead of picking one of two fixed extremes.
+    // The font itself went through two picks: an initial custom VT323
+    // conversion (bumped once, 22px then 26px, after hardware feedback it
+    // could read bigger) was dropped for Space Mono after a direct
+    // side-by-side comparison (see fonts.h) -- VT323's 0/2 digits read as
+    // too similar.
+    auto add_label = [row](const String & text, int16_t width, bool grow, uint32_t color,
+                            bool right_align = false) {
         lv_obj_t * label = lv_label_create(row);
         lv_label_set_text(label, text.c_str());
         lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(label, &lv_font_spacemono_18, 0);
         if (grow) {
             lv_obj_set_flex_grow(label, 1);
-            lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+            // Word-wrap, not ellipsis: reported directly as the preferred
+            // default (Day tab already did this naturally; Week's longer
+            // list was ellipsizing instead) -- LV_LABEL_LONG_DOT was
+            // originally added as the fix for a real row-height-blowout
+            // bug (a fixed-height row plus unbounded wrap), but the row is
+            // no longer fixed-height (see this function's own doc comment
+            // above) specifically so wrap is safe to turn back on.
+            lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
         } else {
             lv_obj_set_width(label, width);
+            // Fixed-width columns (TIME/CCY/ACT/FCST/PREV) still ellipsize
+            // rather than wrap -- these are short, single-value cells, not
+            // free text, so multi-line wrapping would look wrong even
+            // though the row can now grow to fit it. ACT/FCST/PREV are
+            // sized from actual content each refresh (see
+            // compute_column_layout()), so this is now genuinely a
+            // fallback for a still-unusually-wide value, not routine.
+            lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        }
+        if (right_align) {
+            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_RIGHT, 0);
         }
     };
 
@@ -145,44 +351,73 @@ lv_obj_t * make_event_row(lv_obj_t * parent, const CalendarEvent & event)
     const String previous_text = event.previous_revised ? event.previous + "*" : event.previous;
 
     add_label(event.time, col_time_w, false, THEME_COLOR_AMBER);
-    add_label(event.currency, col_ccy_w, false, THEME_COLOR_AMBER_DIM);
+    if (layout.show_ccy) {
+        add_label(event.currency, col_ccy_w, false, THEME_COLOR_AMBER_DIM);
+    }
     add_label(event.name, 0, true, THEME_COLOR_AMBER);
-    add_label(event.actual, col_act_w, false, value_color_for(event.actual_state));
-    add_label(event.forecast, col_fcst_w, false, THEME_COLOR_AMBER_DIM);
-    add_label(previous_text, col_prev_w, false, value_color_for(event.previous_state));
+    // ACT/FCST right-justified too, matching PREV -- reported directly:
+    // left/center-aligned values under a right-aligned PREV read as
+    // inconsistent/misaligned against the header labels above them.
+    add_label(event.actual, layout.act_w, false, value_color_for(event.actual_state), true);
+    add_label(event.forecast, layout.fcst_w, false, THEME_COLOR_AMBER_DIM, true);
+    // PREV right-justified: it's the last column, flush against the
+    // grid's own right edge (see build_events_ui()'s grid_width comment) --
+    // reported directly as wanted, and reads more like a clean table
+    // column of numbers than left-aligned text would in that spot.
+    add_label(previous_text, layout.prev_w, false, value_color_for(event.previous_state), true);
 
     return row;
 }
 
-/** Column header labels, using the same fixed widths as make_event_row(). */
-void make_header_row(lv_obj_t * parent)
+/**
+ * Column header labels, using the same widths/CCY visibility as
+ * make_event_row() gets via the same `layout` (see compute_column_layout()).
+ * Deletes and recreates `header` from scratch every call rather than
+ * resizing labels in place -- this needs to change shape (CCY appearing/
+ * disappearing, not just resizing) on filter changes, and header is cheap
+ * (7 objects) next to the up-to-100+ row list that already gets fully
+ * rebuilt every refresh the same way. Called once with fallback widths in
+ * build_events_ui() (before the first fetch resolves), then again from
+ * populate_events() every refresh with real measurements.
+ */
+void rebuild_header_row(lv_obj_t * parent, const ColumnLayout & layout)
 {
-    lv_obj_t * header = lv_obj_create(parent);
+    if (header != nullptr) {
+        lv_obj_delete(header);
+    }
+    header = lv_obj_create(parent);
     lv_obj_remove_style_all(header);
-    lv_obj_set_size(header, 760, 24);
+    lv_obj_set_size(header, grid_width, 24);
     lv_obj_align(header, LV_ALIGN_TOP_LEFT, 20, 108);
     lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(header, 6, 0);
     lv_obj_set_style_pad_left(header, col_impact_w + 6, 0);
 
-    auto add_header_label = [header](const char * text, int16_t width, bool grow) {
+    auto add_header_label = [](const char * text, int16_t width, bool grow, bool right_align = false) {
         lv_obj_t * label = lv_label_create(header);
         lv_label_set_text(label, text);
         lv_obj_set_style_text_color(label, lv_color_hex(THEME_COLOR_AMBER_DIM), 0);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+        // Matches add_label()'s font -- see its comment for why spacemono_18.
+        lv_obj_set_style_text_font(label, &lv_font_spacemono_18, 0);
         if (grow) {
             lv_obj_set_flex_grow(label, 1);
         } else {
             lv_obj_set_width(label, width);
         }
+        if (right_align) {
+            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_RIGHT, 0);
+        }
     };
 
     add_header_label("TIME", col_time_w, false);
-    add_header_label("CCY", col_ccy_w, false);
+    if (layout.show_ccy) {
+        add_header_label("CCY", col_ccy_w, false);
+    }
     add_header_label("EVENT", 0, true);
-    add_header_label("ACT", col_act_w, false);
-    add_header_label("FCST", col_fcst_w, false);
-    add_header_label("PREV", col_prev_w, false);
+    // ACT/FCST/PREV all right-aligned, matching their data columns below.
+    add_header_label("ACT", layout.act_w, false, true);
+    add_header_label("FCST", layout.fcst_w, false, true);
+    add_header_label("PREV", layout.prev_w, false, true);
 }
 
 /**
@@ -200,7 +435,11 @@ void make_no_server_message(lv_obj_t * parent)
                        "Tap the gear icon above to set one up in\n"
                        "Settings -> Calendar Server.");
     lv_obj_set_style_text_color(no_server_message, lv_color_hex(THEME_COLOR_AMBER_DIM), 0);
-    lv_obj_set_style_text_font(no_server_message, &lv_font_montserrat_20, 0);
+    // spacemono_18, not the button/title-sized spacemono_20 -- this label has no
+    // explicit width set (auto-sized to content), and its longest line at
+    // a wider advance width would run close to the screen's full 800px
+    // width with no wrap safety net.
+    lv_obj_set_style_text_font(no_server_message, &lv_font_spacemono_18, 0);
     lv_obj_set_style_text_align(no_server_message, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(no_server_message, LV_ALIGN_CENTER, 0, 20);
 }
@@ -216,27 +455,33 @@ void build_events_ui(lv_obj_t * screen)
     lv_obj_set_size(week_tab_button, 180, 40);
     lv_obj_align(week_tab_button, LV_ALIGN_TOP_LEFT, 210, 58);
 
-    set_active_tab(week_tab_button, day_tab_button);
+    set_active_tab(day_tab_button, week_tab_button);
 
-    // Sits in the free space to the right of the tabs (they end at x=390;
-    // the WiFi/settings icons start around x=728) rather than needing the
-    // whole layout shifted down again for a dedicated row. Empty until
-    // alert_manager reports a timed event within its 10-minute countdown
-    // window -- see calendar_view_tick().
-    countdown_label = lv_label_create(screen);
-    lv_label_set_text(countdown_label, "");
-    lv_obj_set_style_text_color(countdown_label, lv_color_hex(THEME_COLOR_IMPACT_MEDIUM), 0);
-    lv_obj_set_style_text_font(countdown_label, &lv_font_montserrat_20, 0);
-    lv_obj_set_width(countdown_label, 320);
-    lv_label_set_long_mode(countdown_label, LV_LABEL_LONG_DOT);
-    lv_obj_align(countdown_label, LV_ALIGN_TOP_LEFT, 410, 68);
+    // Grid width computed from the WiFi icon's actual rendered position,
+    // not a guessed pixel constant -- two rounds of hand-picked widths (760,
+    // then 780) both landed short of lining PREV up under the WiFi icon on
+    // real hardware, since the icon's true on-screen edge depends on font
+    // metrics that are easy to get wrong by hand. wifi_icon_label is
+    // created and aligned earlier in calendar_view_create(), before this
+    // function runs -- lv_obj_update_layout() forces its position to
+    // resolve immediately (alignment is otherwise lazily applied on the
+    // next layout pass, not synchronously) so lv_obj_get_coords() below
+    // reflects where it will actually render, not stale coordinates.
+    lv_obj_update_layout(wifi_icon_label);
+    lv_area_t wifi_area;
+    lv_obj_get_coords(wifi_icon_label, &wifi_area);
+    constexpr int16_t grid_x = 20;
+    grid_width = static_cast<int16_t>(wifi_area.x2 - grid_x + 1);
 
-    make_header_row(screen);
+    // Fallback ColumnLayout (show_ccy=true, the *_fallback widths) -- real
+    // values come from compute_column_layout() once populate_events() has
+    // actual data (and the current currency filter) to measure against.
+    rebuild_header_row(screen, ColumnLayout{});
 
     list = lv_obj_create(screen);
     lv_obj_remove_style_all(list);
-    lv_obj_set_size(list, 760, 300);
-    lv_obj_align(list, LV_ALIGN_TOP_LEFT, 20, 136);
+    lv_obj_set_size(list, grid_width, 300);
+    lv_obj_align(list, LV_ALIGN_TOP_LEFT, grid_x, 136);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(list, 4, 0);
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
@@ -245,13 +490,37 @@ void build_events_ui(lv_obj_t * screen)
     status_label = lv_label_create(screen);
     lv_label_set_text(status_label, "");
     lv_obj_set_style_text_color(status_label, lv_color_hex(THEME_COLOR_AMBER_DIM), 0);
-    lv_obj_set_style_text_font(status_label, &lv_font_montserrat_14, 0);
+    // spacemono_18, same reasoning as no_server_message above.
+    lv_obj_set_style_text_font(status_label, &lv_font_spacemono_18, 0);
     lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, 220);
 }
 
-void populate_events(const std::vector<CalendarEvent> & events)
+/**
+ * Deletes every child of `list` one at a time, yielding to
+ * lv_timer_handler() after each one, instead of a single lv_obj_clean()
+ * call. A week view can leave 50-100+ rows (8 LVGL objects each) behind
+ * from the previous fetch -- lv_obj_clean() would destroy all of them in
+ * one uninterrupted burst with no chance for the display pipeline to run
+ * in between, same hazard as the creation loop below.
+ */
+void clear_list_yielding()
 {
-    lv_obj_clean(list);
+    while (lv_obj_get_child_count(list) > 0) {
+        lv_obj_delete(lv_obj_get_child(list, lv_obj_get_child_count(list) - 1));
+        timed_timer_handler("clear_list_yielding");
+    }
+}
+
+void populate_events(const std::vector<CalendarEvent> & events, bool show_ccy)
+{
+    clear_list_yielding();
+
+    // Rebuilt every refresh, not just resized -- widths need to match
+    // whatever's actually in `events` this time (see
+    // compute_column_layout()), and CCY can appear/disappear entirely
+    // depending on the currency filter, not just change size.
+    const ColumnLayout layout = compute_column_layout(events, show_ccy);
+    rebuild_header_row(calendar_screen_ref, layout);
 
     if (events.empty()) {
         lv_label_set_text(status_label, "No events match your current filters for this range.");
@@ -265,18 +534,48 @@ void populate_events(const std::vector<CalendarEvent> & events)
             make_day_separator_row(list, event.day);
             last_day = event.day;
         }
-        make_event_row(list, event);
+        make_event_row(list, event, layout);
+
+        // A week view can be 50-100+ events -- each row is 8 LVGL objects
+        // (the row + an impact bar + 6 labels), so building the whole list
+        // in one uninterrupted burst is hundreds of object
+        // creations/layouts with no call back to lv_timer_handler() in
+        // between. Confirmed directly on hardware: that's long enough to
+        // starve the RGB panel's bounce-buffer refill and cause a visible
+        // "frame shift" (content wrapping toward the bottom of the
+        // screen) -- notably reproducible with I2S audio removed entirely
+        // from this project, ruling out I2S contention as the cause of
+        // this specific symptom (a separate, now-abandoned line of
+        // investigation lives in this file's git history and the
+        // Milestone 8 section of this README).
+        //
+        // Yielding every 8 rows wasn't tight enough margin -- still
+        // reproduced on the Week tab specifically (the tab with enough
+        // events for that gap to matter; Day's much shorter list never
+        // triggered it). Yielding after every single row costs more calls
+        // to lv_timer_handler() but each one is cheap, and this is only
+        // ever running during an explicit refresh, not every frame.
+        timed_timer_handler("populate_events row");
     }
 }
 
 void refresh_events()
 {
     lv_label_set_text(status_label, "Loading events...");
-    lv_timer_handler();
+    timed_timer_handler("refresh_events loading label");
+
+    // CCY column dropped entirely when exactly one currency is selected --
+    // reported directly as wanted ("most people using this are going to
+    // use it for USD"), since a column repeating the same 3-letter code on
+    // every single row is pure waste of EVENT's space. Defaults to shown
+    // (the safe/current behavior) if the filter fetch itself fails, same
+    // fallback direction as everything else here on a network hiccup.
+    CalendarFilters filters;
+    const bool show_ccy = !(calendar_client_get_filters(filters) && filters.currency_codes.size() == 1);
 
     std::vector<CalendarEvent> events;
     if (calendar_client_get_calendar(current_range, events)) {
-        populate_events(events);
+        populate_events(events, show_ccy);
     } else {
         lv_obj_clean(list);
         lv_label_set_text(status_label, "Could not load events -- check the connection and try again.");
@@ -285,8 +584,109 @@ void refresh_events()
     // Unconditional, including on failure/empty (an empty vector clears any
     // previously tracked events) -- alert_manager shouldn't keep counting
     // down to or refreshing for an event that no longer matches current
-    // filters or came from a now-stale fetch.
+    // filters or came from a now-stale fetch. current_events mirrors this
+    // for the same reason: update_next_event_row() needs it to restore a
+    // row's plain time text, and a stale entry there is just as wrong.
+    current_events = events;
     alert_manager_set_events(events);
+
+    // The list was just rebuilt from scratch, so even if the same event(s)
+    // are still tracked as active after this refresh, their border
+    // highlights wouldn't survive on the new row objects -- clear the
+    // tracked set so the next tick re-applies highlights fresh instead of
+    // assuming any from before the rebuild are still there.
+    highlighted_rows.clear();
+}
+
+/** Finds the event row tagged with `id` (see make_event_row()), or nullptr. */
+lv_obj_t * find_row_by_id(long id)
+{
+    const uint32_t child_count = lv_obj_get_child_count(list);
+    for (uint32_t i = 0; i < child_count; ++i) {
+        lv_obj_t * child = lv_obj_get_child(list, i);
+        if (static_cast<long>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(child))) == id) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
+// child(row, 1) is always the TIME label, whether or not CCY is currently
+// shown -- make_event_row() adds impact_bar(0), time(1), then CCY only if
+// layout.show_ccy, so TIME's own index never shifts regardless of that.
+// Relied on here and in update_next_event_row() below.
+
+/** Restores `row`'s TIME label to its plain scheduled time and clears its highlight border. */
+void unhighlight_row(lv_obj_t * row, long id)
+{
+    lv_obj_set_style_border_width(row, 0, 0);
+    for (const CalendarEvent & event : current_events) {
+        if (event.id == id) {
+            lv_label_set_text(lv_obj_get_child(row, 1), event.time.c_str());
+            break;
+        }
+    }
+}
+
+/**
+ * Puts the countdown directly on the row(s) it refers to, instead of a
+ * separate banner: every row alert_manager currently tracks as active
+ * (alert_manager_get_active_event_ids() -- every event within the
+ * 10-minute window, not just the single soonest, since simultaneous
+ * releases are routine) gets its TIME column swapped for a live "MM:SS"
+ * countdown plus a border highlight, and reverts to its plain scheduled
+ * time once it stops being active (event fires, drops out of the window,
+ * or gets filtered out of a later refresh).
+ *
+ * Only touches the row(s) that actually changed state -- the common case
+ * (the same set of events still counting down) is just a label text
+ * update on each already-highlighted row, not a rescan of the whole list
+ * every second.
+ */
+void update_next_event_row()
+{
+    const std::vector<long> active_ids = alert_manager_get_active_event_ids();
+
+    // Drop the highlight from any row that was active last tick but isn't anymore.
+    for (size_t i = 0; i < highlighted_rows.size();) {
+        if (contains_id(active_ids, highlighted_rows[i].id)) {
+            ++i;
+            continue;
+        }
+        lv_obj_t * row = find_row_by_id(highlighted_rows[i].id);
+        if (row != nullptr) {
+            unhighlight_row(row, highlighted_rows[i].id);
+        }
+        highlighted_rows.erase(highlighted_rows.begin() + static_cast<long>(i));
+    }
+
+    // Apply/refresh every currently-active row.
+    for (long id : active_ids) {
+        lv_obj_t * row = find_row_by_id(id);
+        if (row == nullptr) {
+            continue;
+        }
+
+        HighlightedRow * tracked = nullptr;
+        for (HighlightedRow & candidate : highlighted_rows) {
+            if (candidate.id == id) {
+                tracked = &candidate;
+                break;
+            }
+        }
+
+        const String countdown = alert_manager_get_countdown_text_for(id);
+        if (tracked == nullptr) {
+            lv_obj_set_style_border_color(row, lv_color_hex(THEME_COLOR_IMPACT_MEDIUM), 0);
+            lv_obj_set_style_border_width(row, 2, 0);
+            lv_obj_set_style_border_opa(row, LV_OPA_COVER, 0);
+            lv_label_set_text(lv_obj_get_child(row, 1), countdown.c_str());
+            highlighted_rows.push_back({id, countdown});
+        } else if (countdown != tracked->last_shown_countdown_text) {
+            lv_label_set_text(lv_obj_get_child(row, 1), countdown.c_str());
+            tracked->last_shown_countdown_text = countdown;
+        }
+    }
 }
 
 } // namespace
@@ -302,7 +702,16 @@ lv_obj_t * calendar_view_create()
     lv_obj_t * title = lv_label_create(screen);
     lv_label_set_text(title, "UPCOMING EVENTS");
     lv_obj_set_style_text_color(title, lv_color_hex(THEME_COLOR_AMBER), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    // spacemono_32 (see fonts.h) -- originally unscii_16, then bumped to
+    // the button-tier spacemono_20, both reported back as still not
+    // reading like a size change next to the WiFi/gear icons sharing this
+    // top strip. spacemono_32 is a dedicated size for just this title, not
+    // reused anywhere else -- unlike the icons, which anchor to the
+    // top-right corner, the title can't just move, so it had to actually
+    // get bigger rather than share a tier with something else. Not an
+    // app-wide title bump -- this is the only title sharing a row with
+    // icons in the first place.
+    lv_obj_set_style_text_font(title, &lv_font_spacemono_32, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 10);
 
     // WiFi status icon takes the corner spot the gear used to occupy; the
@@ -313,6 +722,8 @@ lv_obj_t * calendar_view_create()
     // here a WiFi drop later has nowhere on-screen to show up.
     wifi_icon_label = lv_label_create(screen);
     lv_label_set_text(wifi_icon_label, LV_SYMBOL_WIFI);
+    // Montserrat, not the retro unscii font -- unscii has no icon/symbol
+    // glyphs, and this label's text is LV_SYMBOL_WIFI, not a word.
     lv_obj_set_style_text_font(wifi_icon_label, &lv_font_montserrat_20, 0);
     lv_obj_align(wifi_icon_label, LV_ALIGN_TOP_RIGHT, -20, 16);
 
@@ -339,6 +750,11 @@ lv_obj_t * calendar_view_create()
     lv_obj_t * settings_button = theme_create_button(screen, LV_SYMBOL_SETTINGS, on_settings_clicked);
     lv_obj_set_size(settings_button, 44, 44);
     lv_obj_align(settings_button, LV_ALIGN_TOP_RIGHT, -72, 6);
+    // theme_create_button() defaults its label to the retro spacemono_20 font,
+    // which has no icon/symbol glyphs -- this label's text is actually
+    // LV_SYMBOL_SETTINGS, so it needs a font that bundles LVGL's symbol
+    // range back.
+    lv_obj_set_style_text_font(lv_obj_get_child(settings_button, 0), &lv_font_montserrat_20, 0);
 
     String server_url;
     if (!calendar_server_url_load(server_url)) {
@@ -393,10 +809,15 @@ void calendar_view_refresh()
 
 void calendar_view_tick()
 {
-    if (countdown_label == nullptr) {
+    if (list == nullptr) {
         return; // no server configured yet, or "no server" message still showing
     }
-    lv_label_set_text(countdown_label, alert_manager_get_countdown_text().c_str());
+    update_next_event_row();
+}
+
+long calendar_view_get_event_id_at(size_t index)
+{
+    return index < current_events.size() ? current_events[index].id : 0;
 }
 
 void calendar_view_poll()

@@ -45,8 +45,24 @@ void calendar_view_refresh();
 void calendar_view_poll();
 
 /**
- * Call every loop() iteration, after alert_manager_tick(). Refreshes the
- * on-screen countdown label from alert_manager_get_countdown_text() -- a
- * no-op if the events UI hasn't been built yet (no server configured).
+ * Call every loop() iteration, after alert_manager_tick(). Finds whichever
+ * row alert_manager_get_next_event_id() names and shows the live countdown
+ * on it (see update_next_event_row() in calendar_view.cpp) -- a no-op if
+ * the events UI hasn't been built yet (no server configured).
  */
 void calendar_view_tick();
+
+/**
+ * CalendarEvent.id of the currently-displayed event at `index` (0 =
+ * first), or 0 if `index` is out of range. Dev/test aid: lets main.cpp's
+ * "testalert" serial command target a real, currently-visible row instead
+ * of a synthetic id that has no corresponding row for
+ * update_next_event_row() to highlight (the countdown lives on the row
+ * itself now, not a standalone banner, so a test event needs a real row to
+ * attach to in order to actually show anything on screen). The index
+ * parameter exists specifically to let "testalert" target two *different*
+ * rows (e.g. "testalert 90 0" and "testalert 95 1") to verify multiple
+ * simultaneous countdowns highlight independently, not just the first row
+ * every time.
+ */
+long calendar_view_get_event_id_at(size_t index);

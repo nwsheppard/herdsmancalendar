@@ -136,7 +136,7 @@ lv_obj_t * build_setup_screen()
     lv_obj_t * title = lv_label_create(screen);
     lv_label_set_text(title, "WIFI SETUP");
     lv_obj_set_style_text_color(title, lv_color_hex(THEME_COLOR_AMBER), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(title, &lv_font_unscii_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
 
     // --- Network list page ---
@@ -187,6 +187,9 @@ lv_obj_t * build_setup_screen()
     lv_obj_t * toggle_btn = theme_create_button(page_password, LV_SYMBOL_EYE_OPEN, on_toggle_password_visibility);
     lv_obj_set_size(toggle_btn, 50, 50);
     password_toggle_icon = lv_obj_get_child(toggle_btn, 0);
+    // theme_create_button() defaults to the retro unscii font, which has no
+    // icon/symbol glyphs -- this label's text is LV_SYMBOL_EYE_OPEN/CLOSED.
+    lv_obj_set_style_text_font(password_toggle_icon, &lv_font_montserrat_20, 0);
     lv_obj_align_to(toggle_btn, password_textarea, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
 
     lv_obj_t * connect_btn = theme_create_button(page_password, "Connect", on_connect_button_clicked);

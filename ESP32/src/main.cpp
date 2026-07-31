@@ -11,6 +11,7 @@
 #include "calendar_client.h"
 #include "calendar_server_store.h"
 #include "calendar_view.h"
+#include "fonts.h"
 #include "theme.h"
 #include "touch.h"
 #include "wifi_credentials_store.h"
@@ -95,6 +96,12 @@ volatile bool wifi_icon_state_dirty = false;
 // while disconnected, rather than trusting the built-in mechanism alone.
 constexpr uint32_t wifi_reconnect_interval_ms = 10000;
 uint32_t last_wifi_reconnect_attempt_ms = 0;
+
+// Stall/glitch diagnostics -- see loop()'s own comment. Same threshold as
+// calendar_view.cpp's timed_timer_handler(): a couple of frames' worth
+// (60fps = ~16.6ms each) is well past routine per-frame variance.
+constexpr uint32_t stall_log_threshold_ms = 20;
+uint32_t last_loop_end_ms = 0;
 
 // Dev/test aid: buffers characters typed into the serial monitor until a
 // newline, then checks for known commands. See handle_serial_command().
@@ -194,13 +201,23 @@ void set_wifi_icon_state(uint32_t color_hex, bool show_strike)
  * in sync regardless) and the calendar screen's own icon -- the latter is
  * a no-op via calendar_view_set_wifi_icon()'s null-check until
  * calendar_view_create() has run.
+ *
+ * The two icons intentionally use different "connected"/"connecting"
+ * colors, not the same pending state applied identically everywhere: the
+ * boot splash's neon green/dim-grey match the terminal artwork's own
+ * palette (THEME_COLOR_SPLASH_*), but that same green read as too bright
+ * against the calendar screen's amber theme (reported directly from
+ * hardware) -- so the calendar icon uses THEME_COLOR_AMBER/_AMBER_DIM
+ * instead, matching the rest of that screen's text. Both keep the same
+ * red "disconnected" color and strike -- that's a status signal, not
+ * theme-driven, and should read the same everywhere.
  */
 void apply_pending_wifi_icon_state()
 {
     switch (pending_wifi_icon_state) {
     case WifiIconState::CONNECTED:
         set_wifi_icon_state(THEME_COLOR_SPLASH_TERMINAL_GREEN, false);
-        calendar_view_set_wifi_icon(THEME_COLOR_SPLASH_TERMINAL_GREEN, false);
+        calendar_view_set_wifi_icon(THEME_COLOR_AMBER, false);
         boot_line_wifi = make_boot_line("WIFI", WiFi.localIP().toString().c_str());
         break;
     case WifiIconState::DISCONNECTED:
@@ -210,7 +227,7 @@ void apply_pending_wifi_icon_state()
         break;
     case WifiIconState::CONNECTING:
         set_wifi_icon_state(THEME_COLOR_SPLASH_DIM, false);
-        calendar_view_set_wifi_icon(THEME_COLOR_SPLASH_DIM, false);
+        calendar_view_set_wifi_icon(THEME_COLOR_AMBER_DIM, false);
         break;
     }
     refresh_boot_log();
@@ -255,27 +272,34 @@ void build_splash_ui()
     // Faux-bold: LVGL's built-in bitmap fonts have no bold variant, so the
     // boot log is drawn twice with a 1px horizontal offset to thicken the
     // strokes and read denser inside the terminal box.
+    // spacemono_18 (see fonts.h), not the bigger button/title spacemono_20 --
+    // boot_line_* strings are hand-padded to 28 chars (make_boot_line())
+    // to fit box_text_width=440px, and 28 * spacemono_20's wider advance width
+    // wouldn't fit that box.
     boot_log_label_shadow = lv_label_create(screen);
     lv_obj_set_pos(boot_log_label_shadow, box_text_x + 1, box_text_y);
     lv_obj_set_width(boot_log_label_shadow, box_text_width);
     lv_obj_set_style_text_color(boot_log_label_shadow, lv_color_hex(THEME_COLOR_SPLASH_TERMINAL_GREEN), 0);
-    lv_obj_set_style_text_font(boot_log_label_shadow, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(boot_log_label_shadow, &lv_font_spacemono_18, 0);
 
     boot_log_label = lv_label_create(screen);
     lv_obj_set_pos(boot_log_label, box_text_x, box_text_y);
     lv_obj_set_width(boot_log_label, box_text_width);
     lv_obj_set_style_text_color(boot_log_label, lv_color_hex(THEME_COLOR_SPLASH_TERMINAL_GREEN), 0);
-    lv_obj_set_style_text_font(boot_log_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(boot_log_label, &lv_font_spacemono_18, 0);
     refresh_boot_log();
 
     lv_obj_t * copyright_label = lv_label_create(screen);
     lv_label_set_text(copyright_label, "(c) 2026 Herdsman Corp.");
     lv_obj_set_style_text_color(copyright_label, lv_color_hex(THEME_COLOR_SPLASH_TERMINAL_GREEN), 0);
-    lv_obj_set_style_text_font(copyright_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(copyright_label, &lv_font_spacemono_18, 0);
     lv_obj_align(copyright_label, LV_ALIGN_BOTTOM_LEFT, 20, -8);
 
     wifi_icon_label = lv_label_create(screen);
     lv_label_set_text(wifi_icon_label, LV_SYMBOL_WIFI);
+    // Montserrat, not the retro Space Mono fonts -- see calendar_view.cpp's
+    // identical comment on its own wifi_icon_label; Space Mono has no
+    // LV_SYMBOL_* glyphs, same gap as unscii before it.
     lv_obj_set_style_text_font(wifi_icon_label, &lv_font_montserrat_20, 0);
     lv_obj_align(wifi_icon_label, LV_ALIGN_BOTTOM_RIGHT, -20, -10);
 
@@ -303,16 +327,19 @@ void repaint_now()
 }
 
 /**
- * Dev/test aid: lets the countdown/sound/post-event-refresh pipeline be
+ * Dev/test aid: lets the countdown/post-event-refresh pipeline be
  * exercised on real hardware without waiting for an actual calendar event
  * to approach -- type into the serial monitor:
- *   testalert                  -> red-folder test event 400s (6:40) out
+ *   testalert                  -> test event 400s (6:40) out, on row 0
  *   testalert <seconds>        -> ...that many seconds out instead
- *   testalert <seconds> <impact_level>  -> and a specific impact level (0-3)
- * 400s default deliberately clears the 5-minute alert threshold with room
- * to spare, so the sound fires for real once the countdown crosses 5:00
- * rather than immediately -- a smoke test that actually exercises the
- * threshold check, not just "does the code path run at all."
+ *   testalert <seconds> <row>  -> ...targeting the Nth displayed row (0 =
+ *                                  first) instead of always the first --
+ *                                  send two overlapping calls with
+ *                                  different row indices to verify
+ *                                  multiple simultaneous countdowns
+ *                                  highlight independently
+ * (No sound alert or impact level anymore -- see alert_manager.h for why
+ * the sound alert was dropped.)
  */
 void handle_serial_command(const String & command)
 {
@@ -321,21 +348,25 @@ void handle_serial_command(const String & command)
     }
 
     long seconds_from_now = 400;
-    int impact_level = 3;
+    size_t row_index = 0;
 
     String rest = command.substring(String("testalert").length());
     rest.trim();
     if (rest.length() > 0) {
         const int space_index = rest.indexOf(' ');
-        if (space_index >= 0) {
-            seconds_from_now = rest.substring(0, space_index).toInt();
-            impact_level = rest.substring(space_index + 1).toInt();
-        } else {
+        if (space_index < 0) {
             seconds_from_now = rest.toInt();
+        } else {
+            seconds_from_now = rest.substring(0, space_index).toInt();
+            row_index = static_cast<size_t>(rest.substring(space_index + 1).toInt());
         }
     }
 
-    alert_manager_inject_test_event(seconds_from_now, impact_level);
+    // Reuse a real, currently-displayed row's id (rather than a synthetic
+    // one) so the countdown actually has a row to show up on -- see
+    // alert_manager_inject_test_event()'s doc comment for why a synthetic
+    // id alone doesn't render anything anymore.
+    alert_manager_inject_test_event(seconds_from_now, calendar_view_get_event_id_at(row_index));
 }
 
 void poll_serial_commands()
@@ -478,6 +509,23 @@ void setup()
 
 void loop()
 {
+    // Diagnostics for the still-recurring frame-shift/pixelation glitch:
+    // any gap this large between consecutive loop() iterations means
+    // *something* blocked for a while without giving lv_timer_handler() a
+    // chance to run and keep the RGB panel's bounce buffer fed -- this
+    // catches any such stall generically (WiFi reconnects, NVS/Preferences
+    // access, anything else that isn't already individually timed), not
+    // just the specific spots already instrumented (calendar_client.cpp's
+    // GET/parse timing, calendar_view.cpp's timed_timer_handler()).
+    const uint32_t loop_start_ms = millis();
+    if (last_loop_end_ms != 0) {
+        const uint32_t gap_ms = loop_start_ms - last_loop_end_ms;
+        if (gap_ms > stall_log_threshold_ms) {
+            Serial.printf("[stall] %lums gap between loop() iterations, ending t=%lums\n",
+                          static_cast<unsigned long>(gap_ms), static_cast<unsigned long>(loop_start_ms));
+        }
+    }
+
     if (wifi_icon_state_dirty) {
         wifi_icon_state_dirty = false;
         apply_pending_wifi_icon_state();
@@ -497,6 +545,14 @@ void loop()
     alert_manager_tick();
     calendar_view_tick();
 
+    const uint32_t timer_start_ms = millis();
     lv_timer_handler();
+    const uint32_t timer_elapsed_ms = millis() - timer_start_ms;
+    if (timer_elapsed_ms > stall_log_threshold_ms) {
+        Serial.printf("[stall] lv_timer_handler() (main loop) took %lums, ending t=%lums\n",
+                      static_cast<unsigned long>(timer_elapsed_ms), static_cast<unsigned long>(millis()));
+    }
+
     delay(5);
+    last_loop_end_ms = millis();
 }

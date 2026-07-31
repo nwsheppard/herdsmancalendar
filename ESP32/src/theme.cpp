@@ -1,3 +1,4 @@
+#include "fonts.h"
 #include "theme.h"
 
 lv_obj_t * theme_create_button(lv_obj_t * parent, const char * text, lv_event_cb_t callback,
@@ -15,6 +16,21 @@ lv_obj_t * theme_create_button(lv_obj_t * parent, const char * text, lv_event_cb
     lv_obj_t * label = lv_label_create(button);
     lv_label_set_text(label, text);
     lv_obj_set_style_text_color(label, lv_color_hex(THEME_COLOR_AMBER), 0);
+    // Retro default for every button's label -- previously fell through to
+    // LV_FONT_DEFAULT (still Montserrat) since nothing here ever set a font
+    // explicitly, which is why the first font-wide VGA-style swap missed
+    // every button. spacemono_20 (see fonts.h), not spacemono_18 (the
+    // grid/body size) -- buttons are touch targets, not dense data, and
+    // get their own larger tier; also not LVGL's built-in unscii_16, which
+    // measured out too wide for these buttons on hardware (text reaching
+    // the sides). Space Mono, not the original custom VT323 conversion --
+    // dropped after a direct side-by-side comparison found VT323's 0/2
+    // digits read as too similar (see fonts.h). Callers whose text is
+    // actually an LV_SYMBOL_* icon (the settings gear, the WiFi-setup
+    // password eye-toggle) override this back to a Montserrat size
+    // afterward -- Space Mono has no icon/symbol glyphs, so an icon button
+    // left on this font renders as a blank/placeholder box.
+    lv_obj_set_style_text_font(label, &lv_font_spacemono_20, 0);
     lv_obj_center(label);
 
     if (callback != nullptr) {

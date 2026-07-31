@@ -89,7 +89,7 @@ void settings_filters_screen_open(lv_obj_t * previous_screen)
     lv_obj_t * title = lv_label_create(screen);
     lv_label_set_text(title, "IMPACT & CURRENCIES");
     lv_obj_set_style_text_color(title, lv_color_hex(THEME_COLOR_AMBER), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(title, &lv_font_unscii_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 10);
 
     lv_obj_t * impact_label = lv_label_create(screen);

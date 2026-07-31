@@ -41,7 +41,11 @@ String http_get(const String & path)
     } else {
         Serial.printf("GET %s failed, status/error: %d\n", url.c_str(), status);
     }
-    Serial.printf("GET %s -> %d (%lu ms)\n", url.c_str(), status, static_cast<unsigned long>(elapsed_ms));
+    // Absolute timestamp (not just elapsed) alongside the duration -- lets a
+    // stall/glitch reported against wall-clock/uptime be checked against
+    // this log after the fact, not just "this particular GET was slow."
+    Serial.printf("GET %s -> %d (%lu ms, ending t=%lums)\n", url.c_str(), status,
+                  static_cast<unsigned long>(elapsed_ms), static_cast<unsigned long>(millis()));
     http.end();
     return body;
 }
@@ -143,6 +147,17 @@ bool calendar_client_get_calendar(const String & range, std::vector<CalendarEven
         return false;
     }
 
+    // Parsing (deserializeJson() plus the loop below building each
+    // CalendarEvent's String fields) has no natural yield point the way
+    // calendar_view.cpp's row-building loop does -- for a week's worth of
+    // events (100+), this runs uninterrupted with no lv_timer_handler()
+    // call in between, same hazard as the (already fixed) row-building
+    // loop. Logged unconditionally, not just above some threshold -- this
+    // only runs once per refresh, not once per frame, so it's cheap either
+    // way and worth seeing on every call while tracking down the
+    // still-recurring screen glitch.
+    const uint32_t parse_start_ms = millis();
+
     JsonDocument doc;
     const DeserializationError error = deserializeJson(doc, body);
     if (error) {
@@ -173,6 +188,10 @@ bool calendar_client_get_calendar(const String & range, std::vector<CalendarEven
         event.previous_revised = entry["previous_revised"].as<bool>();
         result.push_back(event);
     }
+
+    Serial.printf("Parsed /calendar body: %u events in %lums, ending t=%lums\n",
+                  static_cast<unsigned>(result.size()),
+                  static_cast<unsigned long>(millis() - parse_start_ms), static_cast<unsigned long>(millis()));
 
     out = result;
     return true;

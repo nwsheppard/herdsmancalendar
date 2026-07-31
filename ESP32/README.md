@@ -563,13 +563,17 @@ verified end-to-end there; this milestone is untested on real hardware
 behavior (loading state, tab switching, periodic poll, post-Settings
 refresh) hasn't been confirmed on the device yet.
 
-## Milestone 8: countdown/alert logic + value coloring — done
+## Milestone 8: countdown/alert logic + value coloring — done (sound alert dropped)
 
 Requested as an addition to Milestone 7 rather than waiting for its own
 pass: a live countdown to the next event, a sound alert for high-impact
 events, an automatic post-event refresh, and coloring actual/previous
 values the same way forexfactory.com does. All four needed real
-wall-clock time, which this firmware didn't have until now.
+wall-clock time, which this firmware didn't have until now. **The sound
+alert was ultimately dropped** after reliably corrupting the display on
+real hardware and a full afternoon of escalating fixes -- see the hardware
+debugging log and final outcome at the bottom of this section before
+assuming `audio_player.*` still exists; it doesn't.
 
 - **NTP + timezone, not just NTP.** Forex Factory's `day`/`time` text
   carries no timezone of its own, and turned out not to be in the ESP32's
@@ -590,38 +594,34 @@ wall-clock time, which this firmware didn't have until now.
   timestamp (skipping "All Day"/"Tentative" -- nothing to count down to)
   and keeps the parsed list. `alert_manager_tick()`, called every `loop()`
   iteration but rate-limited internally to once a second, then:
-  - tracks the soonest event within 10 minutes and exposes it as countdown
-    text (`alert_manager_get_countdown_text()`, e.g. "NEXT: NFP in 09:47")
-  - plays a sound 5 minutes before, but only for `impact_level == 3`
-    (red-folder/high-impact) events
+  - tracks the soonest event within 10 minutes and exposes both a countdown
+    string as "MM:SS" (`alert_manager_get_countdown_text()`) and that
+    event's id (`alert_manager_get_next_event_id()`)
   - calls `calendar_view_refresh()` 30-40 seconds after an event's
     scheduled time, once, to pick up its just-released actual value
 
-  Each of the sound/refresh actions is tracked per event ID (Forex
-  Factory's own stable `data-event-id`, now returned as `id` in
-  `/calendar`'s JSON -- see `LXC/README.md`) so a threshold staying crossed
-  for several ticks doesn't repeat the action every tick.
-- **`audio_player.*` (new)**: I2S tone generation for the alert sound.
-  Pins (DOUT=17, BCLK=42, LRC=18) are verified directly against Elecrow's
-  own V3.0 hardware example
-  (`example/V3.0/Arduino/Course/Example2_Play_music`) -- the same hardware
-  revision this project's display/board config already came from -- not
-  guessed, and confirmed not to overlap any pin already used for display/
-  touch/backlight. Raw sine-wave synthesis over the legacy ESP-IDF
-  `driver/i2s.h`, matching Elecrow's own example's approach exactly, rather
-  than a full audio-file decoder library -- alert sounds are short
-  synthesized beeps, not music/speech, so a decoder would be unused
-  complexity. The legacy `driver/i2s.h` header does emit a build-time
-  deprecation warning (ESP-IDF suggests `driver/i2s_std.h` instead); left
-  as-is since it matches the verified-working vendor reference rather than
-  rewriting to an unverified newer API.
-- **Countdown display** sits in the calendar screen's existing free space
-  to the right of the Day/Week tabs (x=410, next to tabs ending at x=390
-  and the WiFi/settings icons starting around x=728) rather than requiring
-  the whole layout to shift down again for a dedicated row. Empty unless
-  `alert_manager` has a timed event within its 10-minute window.
-  `calendar_view_tick()` (new, called every `loop()` iteration right after
-  `alert_manager_tick()`) is the only thing that touches it.
+  The refresh is tracked per event ID (Forex Factory's own stable
+  `data-event-id`, now returned as `id` in `/calendar`'s JSON -- see
+  `LXC/README.md`) so a threshold staying crossed for several ticks
+  doesn't repeat it every tick. Originally also played a sound 5 minutes
+  before red-folder events -- dropped; see below.
+- **Countdown display lives on the event's own row**, not a separate
+  banner. Originally it was a standalone label next to the Day/Week tabs,
+  but the user asked to move it onto "the line that is upcoming" instead:
+  each row is now tagged with its event id via `lv_obj_set_user_data()`
+  (same pattern already used for checkboxes in
+  `settings_filters_screen.cpp`/`settings_columns_screen.cpp`), and
+  `calendar_view_tick()` -> `update_next_event_row()` swaps that row's TIME
+  column from its scheduled clock time to the live "MM:SS" countdown and
+  adds an amber border, reverting the row back to its plain time once it
+  stops being "next" (event fires, drops out of the 10-minute window, or a
+  refresh drops it). Only touches the row(s) that actually changed state --
+  the common case (same event, next tick) is a single label update on the
+  already-highlighted row, not a full-list rescan every second. A fresh
+  `refresh_events()` call resets the tracked highlight id so the border
+  gets reapplied to the new row objects rather than assuming a highlight
+  from before the list rebuild survived (it doesn't -- `lv_obj_clean()`/
+  `clear_list_yielding()` destroy the old row objects entirely).
   `calendar_view_refresh()`/`alert_manager_set_events()` call each other
   across module boundaries (calendar_view triggers alert tracking after
   each fetch; alert_manager triggers a refetch 30-40s after an event) --
@@ -638,16 +638,15 @@ wall-clock time, which this firmware didn't have until now.
   `previous_revised`**, parsed in `calendar_client.cpp` alongside the
   existing fields -- same shape as the JSON, nothing derived client-side.
 
-**Build status:** compiles cleanly (RAM 35.3%, 115,568 / 327,680 bytes;
-Flash 72.4%, 2,277,791 / 3,145,728 bytes -- still comfortable headroom).
-One expected warning (the legacy I2S deprecation notice above), no others.
-Backend fields verified end-to-end against the live site (real
+**Build status (final, sound removed):** compiles cleanly, no warnings
+(RAM 35.3%, 115,520 / 327,680 bytes; Flash 71.8%, 2,258,531 / 3,145,728
+bytes). Backend fields verified end-to-end against the live site (real
 better/worse/neutral distributions, real revision flags) -- see
-`LXC/README.md`. The alert timing/audio/countdown behavior itself is
-untested on real hardware (no device access) -- the logic was written
-against real, verified inputs (actual DST rules, actual I2S pins, actual
-event ID stability) rather than guessed, but hasn't been confirmed on the
-device yet.
+`LXC/README.md`. Countdown display and the post-event auto-refresh were
+confirmed working on real hardware via the `testalert` serial command
+(see below); the sound alert was also confirmed working (it played), but
+reliably corrupted the display doing so, and was removed -- see the full
+debugging log below for why.
 
 **Resolved from hardware testing: display corrupted (white/black, garbage
 scrolling down the screen) immediately after boot, right after WiFi
@@ -739,12 +738,749 @@ I2S at 44100Hz (CD quality) for two plain sine beeps (880Hz/1318Hz) whose
 Nyquist requirement is under 2700Hz -- massive, unnecessary headroom that
 was pure added contention with nothing to show for it. Dropped to 8000Hz,
 roughly a 5.5x cut in I2S's actual DMA bandwidth footprint, on top of
-(not instead of) the larger bounce buffer. **Untested on hardware yet.**
-If pixelation still happens after *both* of these, that's a stronger
-signal the ESP-IDF sdkconfig levers (`CONFIG_LCD_RGB_RESTART_IN_VSYNC`
-etc., which need the `arduino, espidf` combined build mode) are actually
-necessary rather than optional -- worth treating that as the next step in
-sequence, not a third parallel guess.
+(not instead of) the larger bounce buffer.
+
+**Same issue a third time, with a different symptom, confirmed the real
+fix needed Kconfig access.** Reported from hardware: elements ("Upcoming
+Events" title, gear icon) visually shifted/dropped toward the bottom of
+the screen, not just pixelated -- a different, more specific ESP32-S3
+RGB LCD failure mode than plain corruption, known as "frame shift" (a
+DMA stall desyncs the panel driver's internal read pointer from the
+display's actual VSYNC timing). This has one documented fix,
+`CONFIG_LCD_RGB_RESTART_IN_VSYNC`, which is an ESP-IDF Kconfig option --
+unreachable from `framework = arduino` (prebuilt libraries), only
+reachable by switching to the combined `framework = arduino, espidf`
+build (Arduino compiled as an ESP-IDF component from source).
+
+**That switch was attempted on a `esp32-espidf-build-mode` branch (work
+backed up via a commit on `main` first) and ultimately abandoned.** In
+order, hit and resolved:
+1. A corrupted `tool-cmake` package (PlatformIO's own extraction silently
+   dropped `cmake.exe` from the installed package -- not antivirus, a
+   manual re-extraction confirmed the binary persisted and ran fine once
+   placed by hand).
+2. ESP-IDF's CMake tooling hard-rejects any project path containing a
+   space -- and this repository's parent folder was named "CRT Terminal".
+   Neither a `subst` drive letter nor a proper NTFS junction fully masked
+   this: a component (`libsodium`, pulled in transitively by Arduino's
+   mandatory RainMaker/Zigbee/Modbus/Insights dependencies for the esp32s3
+   target -- none of which this project uses) still baked the real,
+   space-containing absolute path into its build commands regardless of
+   which alias the build ran from. Resolved only by actually renaming the
+   folder to `CRT-Terminal` (done with the user's explicit confirmation,
+   since it's a real filesystem change outside the repo itself).
+3. `CONFIG_FREERTOS_HZ=1000` required (Arduino's timing assumes a 1ms
+   tick; ESP-IDF's plain default is 100Hz).
+4. `CONFIG_AUTOSTART_ARDUINO=y` required (without it, nothing provides
+   `app_main()`, so `setup()`/`loop()` never get called at all).
+
+Then hit a fifth issue with no quick documented fix: `NetworkClientSecure`
+(part of Arduino's WiFi library, unused by this project -- everything
+here is plain `http://`) failed to link with undefined references into
+`ssl_client.cpp` (`start_ssl_client`, `send_ssl_data`, etc.) -- the file
+exists in `arduino-esp32` but wasn't part of whatever source list
+PlatformIO's Arduino-as-component integration compiles in this
+configuration. At that point -- four unrelated build-system issues
+already resolved, a fifth with no clear answer in hand, and still not
+having reached the point of even testing whether
+`CONFIG_LCD_RGB_RESTART_IN_VSYNC` fixes the original bug -- the decision
+was made to stop rather than keep absorbing open-ended risk for a
+nice-to-have feature. Reverted to the `main` checkpoint;
+`esp32-espidf-build-mode` remains as a branch if this is ever worth
+revisiting (a repo without "CRT Terminal"'s space in its path is one
+fewer issue to solve next time).
+
+**Final decision (at the time): the sound alert is dropped, not fixed.**
+`audio_player.h`/`.cpp` deleted; `alert_manager.*` no longer references
+impact level or plays anything, just tracks the countdown and triggers
+the post-event refresh. `main.cpp`'s `testalert` command lost its
+`<impact_level>` argument accordingly (it never did anything without the
+sound to gate).
+
+**The I2S diagnosis above was wrong.** Reported from hardware afterward:
+the exact same "frame shift" symptom (header/gear icon dropping toward
+the bottom of the screen) still happened on a plain calendar refresh --
+with the sound alert, `audio_player.*`, and all I2S code completely
+removed from the project. That ruled out every fix attempted above
+(bounce buffer size, I2S sample rate, and the abandoned
+`CONFIG_LCD_RGB_RESTART_IN_VSYNC` build-mode detour) as ever having
+addressed the actual cause -- they were chasing a coincidence: the
+`testalert` runs that "confirmed" I2S as the cause always also triggered
+a `calendar_view_refresh()` (the post-event auto-refresh, 30-40s after
+the test event's simulated time), and that refresh was the real trigger
+all along.
+
+**Real root cause:** `populate_events()` (`calendar_view.cpp`) calls
+`lv_obj_clean(list)` to clear the old event rows, then loops building new
+ones -- each row is 8 LVGL objects (the row + an impact bar + 6 labels).
+A week view can be 50-100+ events, so a single refresh is hundreds of
+object creations and flex-layout recalculations in one uninterrupted
+burst, with no call back to `lv_timer_handler()` anywhere in that loop.
+LVGL's own rendering *and* this project's RGB panel flush
+(`display_flush()` -> `presentFrameBuffer()` in `main.cpp`) only run when
+`lv_timer_handler()` runs -- so a long enough gap between calls starves
+the panel's bounce-buffer refill exactly the way sustained I2S DMA was
+suspected of doing, except the actual cause was this project's own UI
+code blocking the timer loop, not a peripheral contention issue at all.
+
+**Fix:** `populate_events()` now calls `lv_timer_handler()` once right
+after `lv_obj_clean(list)`, and again every 8 rows while building the new
+list, so no single blocking stretch runs long enough to trigger the
+symptom. No build-system changes, no ESP-IDF Kconfig access needed --
+this was fixable entirely in application code once correctly diagnosed.
+
+**Every-8-rows wasn't tight enough margin.** Confirmed on hardware: fixed
+on the Day tab (short list), still reproduced on the Week tab
+specifically (50-100+ events -- the one case where an 8-row gap is still
+a lot of uninterrupted object creation). Tightened twice:
+1. `lv_obj_clean(list)` (a single call that can destroy 100+ objects left
+   over from the previous fetch) never got a chance to yield mid-teardown
+   at all, only once after it finished. Replaced with
+   `clear_list_yielding()`, which deletes one child at a time and calls
+   `lv_timer_handler()` after each.
+2. The creation loop's "every 8 rows" became every single row.
+
+More `lv_timer_handler()` calls than strictly necessary is cheap
+insurance here -- this only runs during an explicit refresh (tab switch,
+periodic poll, post-Settings, post-event), not every frame, so the extra
+call overhead doesn't cost anything that matters.
+
+**Still recurring after the every-row fix, including brief self-correcting
+"blips" (screen shifts, then recovers on its own)** -- reported from
+hardware. That self-correcting behavior is actually a useful clue: it
+reads more like the RGB panel's VSYNC-vs-DMA-readpointer desync
+(`CONFIG_LCD_RGB_RESTART_IN_VSYNC`'s territory -- see above) recovering on
+its own once a later `lv_timer_handler()` call catches back up, rather
+than a hard corruption that only clears on reset. `populate_events()`'s
+row-building loop was the confirmed cause of the original, more severe
+symptom, but per-row yielding doesn't cover every stall in this codebase --
+notably, `calendar_client_get_calendar()`'s `deserializeJson()` call plus
+the loop building each `CalendarEvent`'s `String` fields (`calendar_client.cpp`)
+runs with **no** `lv_timer_handler()` call anywhere in it, same hazard as
+the row-building loop, and for a week's worth of events (100+) is a
+plausible-sized stall on its own.
+
+**Added instead of another guess: logging to pin down exactly when and
+where a stall happens**, rather than continuing to patch specific call
+sites one at a time against symptoms alone:
+- `calendar_view.cpp`'s `timed_timer_handler(context)` wraps every
+  `lv_timer_handler()` call in this file (`clear_list_yielding()`,
+  `populate_events()`'s per-row yield, `refresh_events()`'s "Loading
+  events..." repaint) and logs to Serial (with an absolute `millis()`
+  timestamp) whenever a single call takes more than 20ms -- roughly a
+  couple of frames' worth at 60fps, well past routine per-frame variance.
+- `main.cpp`'s `loop()` does the same for its own `lv_timer_handler()`
+  call, *and* separately logs whenever the gap between one loop()
+  iteration ending and the next starting exceeds the same 20ms threshold
+  -- a catch-all for any stall not individually instrumented elsewhere
+  (WiFi reconnects, NVS/Preferences access, touch I2C hiccups, etc.),
+  since it fires on elapsed wall-clock time regardless of which line
+  caused it.
+- `calendar_client.cpp`'s `http_get()` already logged each GET's elapsed
+  time; now also logs an absolute ending timestamp alongside it, and
+  `calendar_client_get_calendar()` separately logs how long parsing the
+  response body took (event count + elapsed + ending timestamp),
+  unconditionally (it only runs once per refresh, not once per frame, so
+  there's no noise concern).
+
+None of this fixes anything by itself -- it's purely diagnostic. Compiles
+clean (RAM 35.3%, Flash 71.8%).
+
+**The logging paid off immediately.** With no countdown active, no
+stalls logged at all over normal use -- consistent with the user's report
+that the original frame-shift symptom hadn't recurred since the yield
+fixes. But testing the new row-based countdown (`testalert`, targeted at
+a real displayed row via `calendar_view_get_first_event_id()` -- seebelow)
+turned up a **different, previously invisible problem**: once a countdown
+was actively showing on a row, `lv_timer_handler() (main loop)` logged a
+~66-67ms stall on essentially *every single* `loop()` iteration,
+continuously, for the entire time the countdown was up (with periodic
+~102ms spikes on top, once a second) -- not an occasional glitch, a
+sustained ~15x/second cost the whole feature was quietly paying.
+
+**Root cause:** `calendar_view_tick()` -> `update_next_event_row()` runs
+every `loop()` iteration (unrated), and its "same event still counting
+down" fast path called `lv_label_set_text()` on the row's TIME label every
+single time, even though `alert_manager_get_countdown_text()`'s return
+value only actually *changes* once a second (alert_manager rate-limits its
+own tick internally). LVGL's `lv_label_set_text()` invalidates the label
+regardless of whether the new text equals the old text, and this
+project's display is configured `LV_DISPLAY_RENDER_MODE_FULL` -- any
+invalidation forces a full 800x480 frame redraw and `presentFrameBuffer()`
+call, which at this panel's 12MHz pixel clock costs ~66ms. So for as long
+as a countdown was visible, the main loop was silently doing a full,
+unnecessary frame redraw around 15 times a second instead of once. This is
+a very plausible explanation for the intermittent "screen shifts, then
+recovers on its own" blips reported from hardware -- a sustained,
+self-inflicted near-continuous redraw load is exactly the kind of thing
+that could intermittently starve the bounce buffer/DMA timing without
+being severe enough to cause the harder, non-recovering corruption from
+Milestone 8's original bug.
+
+**Fix:** `calendar_view.cpp` now tracks `last_shown_countdown_text` and
+only calls `lv_label_set_text()` when the countdown string actually
+changed since the last tick, both in the "same event" fast path and when a
+new row first gets highlighted. Compiles clean (RAM 35.3%, Flash 71.9%).
+
+**Confirmed on hardware.** Re-running `testalert` after this fix: the
+constant ~66-67ms stall on every single `loop()` iteration is gone,
+replaced by a single elevated `lv_timer_handler()` line roughly once a
+second (~69-105ms) -- matching the countdown label legitimately changing
+once a second and triggering one real full-frame redraw, not a bug. Visual
+confirmation from hardware: no shift/pixelation seen while the countdown
+was live on a row. One open, minor curiosity not yet explained: that
+once-a-second stall's duration drifts upward over about 7 cycles (69 -> 74
+-> 79 -> 83 -> 88 -> 94 -> 100ms) before resetting -- much smaller and less
+severe than the original bug, not investigated further since the visible
+symptom is gone.
+
+Also fixed alongside this: `alert_manager_inject_test_event()` originally
+always used a synthetic, decrementing id (e.g. `-1`) that has no
+corresponding row in the currently-displayed list -- harmless when the
+countdown was a standalone banner (any text would do), but once the
+countdown moved onto the row itself, a synthetic id meant
+`update_next_event_row()` had nothing to find and highlight, so
+`testalert` silently did nothing visible. `alert_manager_inject_test_event()`
+gained an optional `reuse_event_id` parameter, and `main.cpp`'s
+`handle_serial_command()` now passes `calendar_view_get_first_event_id()`
+(a new accessor exposing the first currently-displayed event's real id) so
+the test countdown actually lands on a visible row.
+
+**Two small UI changes alongside the retest:**
+- **Day Events is now the default launch screen**, not Week (`current_range`
+  in `calendar_view.cpp` now starts `"day"`, and `build_events_ui()`
+  initializes the tab styling to match via `set_active_tab(day_tab_button,
+  week_tab_button)`). Purely a user preference -- `calendar_api.py`'s own
+  `/calendar` endpoint still defaults to `week` when no `range` param is
+  given, this only changes what the firmware requests first.
+- **Font swapped app-wide from Montserrat to LVGL's built-in `unscii_16`**,
+  a monospace bitmap font modeled on classic PC/VGA text-mode glyphs --
+  fits this project's retro-CRT-terminal styling much better than a
+  proportional sans-serif, and reads as "more VGA" per the request. Every
+  `lv_font_montserrat_14`/`_20`/`_40` usage across the whole app (calendar
+  view, boot splash, settings and its sub-screens, WiFi setup) now points
+  at `&lv_font_unscii_16` -- one consistent retro font everywhere rather
+  than swapping only the calendar screen and leaving other screens
+  mismatched. `platformio.ini`'s `LV_FONT_MONTSERRAT_*` flags were
+  initially replaced outright with a single `LV_FONT_UNSCII_16=1`.
+
+  **Wrong on the glyph metrics, caught immediately from hardware.** The
+  original writeup here claimed unscii's glyphs are a fixed 8px wide,
+  narrower than Montserrat's proportional metrics -- backwards. Checked
+  directly against the generated font source
+  (`.pio/libdeps/esp32s3/lvgl/src/font/lv_font_unscii_16.c`): every glyph's
+  `adv_w` is `256` in LVGL's 1/16px fixed-point encoding, i.e. **16px
+  wide** -- unscii_16 is a 16x16 monospace font, not 8 wide x16 tall. Real
+  hardware promptly reported exactly what that implies: grid cells
+  wrapping (a fixed-width TIME/ACT/FCST/PREV column budgeted for
+  Montserrat 14's much narrower proportional digits couldn't hold text at
+  16px/character), button labels unaffected (`theme_create_button()` never
+  set an explicit font on its label to begin with, silently falling
+  through to `LV_FONT_DEFAULT` the whole time -- the app-wide swap missed
+  every single button), and the WiFi icon rendering as a blank box (unscii
+  has no `LV_SYMBOL_*` glyphs at all; only Montserrat's tables bundle
+  LVGL's icon range).
+
+  **Fix, three parts:**
+  1. Added `LV_FONT_UNSCII_8=1` (8x8, confirmed `adv_w=128`/8px from the
+     same source file) for anything living in a tight, fixed-width space:
+     the event grid's cells and header row, the day-separator label, and
+     the two message labels with no explicit width set
+     (`no_server_message`, `status_label` -- both have long lines that
+     would've run close to or past the 800px screen width at 16px/char)
+     and the boot splash's boot-log/copyright text (hand-padded to a fixed
+     28-char width in `make_boot_line()`, sized for the box at
+     `box_text_width=440px`). `unscii_16` stays for standalone text with
+     no tight width budget: the calendar/settings/wifi-setup screen titles.
+  2. `theme_create_button()` (`theme.cpp`) now explicitly sets
+     `&lv_font_unscii_16` on every button's label instead of silently
+     inheriting `LV_FONT_DEFAULT` -- this is what actually fixes "button
+     fonts are still the same," in one place rather than at each of the
+     ~15 call sites. The two call sites whose "text" is actually an
+     `LV_SYMBOL_*` icon (the settings gear, the WiFi-setup password
+     eye-toggle) explicitly override the label back to `&lv_font_montserrat_20`
+     immediately after creation, same reasoning as the WiFi status icon fix.
+  3. Both WiFi status icon labels (`main.cpp`'s boot splash,
+     `calendar_view.cpp`'s calendar screen) reverted from unscii back to
+     `&lv_font_montserrat_20` -- an icon glyph, not a word, needs a font
+     that actually contains it.
+
+  `platformio.ini` now enables `LV_FONT_UNSCII_8`, `LV_FONT_UNSCII_16`,
+  `LV_FONT_MONTSERRAT_14` (restored, kept as `LV_FONT_DEFAULT` so anything
+  not explicitly touched by this change -- checkboxes, dropdowns, textarea
+  placeholders on the filters/columns/server settings screens -- keeps its
+  original pre-font-swap appearance rather than silently inheriting
+  whatever LVGL's fallback logic picks with Montserrat 14 no longer
+  enabled) and `LV_FONT_MONTSERRAT_20` (icons + button-adjacent Montserrat
+  needs). Also added `LV_LABEL_LONG_DOT` to every fixed-width grid label
+  (previously only the flexible EVENT-name column had a long_mode set at
+  all -- the fixed columns silently defaulted to LVGL's wrap-by-default,
+  which is what actually broke the row's fixed 56px height): belt-and-
+  suspenders so a still-too-long value in the future ellipsizes instead of
+  wrapping and blowing out the row, regardless of font. Compiles clean
+  (RAM 35.3%, Flash 69.7%). **Not yet re-confirmed on hardware** as of this
+  writing.
+
+**Countdown extended to multiple simultaneous events.** Raised directly
+from a design question about the row-based countdown: the original
+implementation only ever tracked a single "soonest" event
+(`alert_manager_get_next_event_id()`), so if two or more events shared (or
+nearly shared) a scheduled time -- routine for a trading calendar, e.g.
+several US indicators all releasing at 8:30am -- only the first one the
+scan happened to see got a countdown; the others got nothing despite being
+equally "next." Reworked to highlight all of them:
+- `alert_manager.*`: `next_event_id`/`alert_manager_get_countdown_text()`
+  (singular) replaced with `active_events` (every `{id, seconds_left}`
+  currently inside the 10-minute window, recomputed every tick, not just
+  the minimum) and two accessors: `alert_manager_get_active_event_ids()`
+  (all of them) and `alert_manager_get_countdown_text_for(event_id)` (that
+  specific one's "MM:SS", or `""` if it's not active).
+- `calendar_view.cpp`: `highlighted_event_id`/`last_shown_countdown_text`
+  (singular) replaced with `highlighted_rows` (a
+  `vector<{id, last_shown_countdown_text}>`). `update_next_event_row()`
+  diffs the previous tick's highlighted set against the current active
+  set: rows that dropped out get unhighlighted
+  (`unhighlight_row()`, factored out since both the old single-event code
+  path and this one needed it), rows newly active get the border +
+  initial countdown text, and rows still active only get a
+  `lv_label_set_text()` call if their own countdown string actually
+  changed -- same per-row anti-thrash guard as the single-event version,
+  just tracked per id now instead of once globally.
+
+`testalert`'s serial command gained a second optional argument to test
+this -- `testalert <seconds> <row_index>` targets the Nth currently-
+displayed row (0 = first, the previous always-first behavior) instead of
+always the first, via a new `calendar_view_get_event_id_at(index)`
+accessor. Two overlapping calls with different row indices (e.g.
+`testalert 90 0` then `testalert 95 1`) let both be verified at once
+without waiting for a real simultaneous release. **Confirmed on hardware**:
+both rows highlighted independently, each with its own live countdown.
+
+- The settings screen's big "SETTINGS" header (previously Montserrat 40px,
+  no same-size monospace unscii equivalent exists) now also uses
+  `unscii_16`, smaller than before -- kept for font-family consistency with
+  the rest of the app over preserving that one header's original size.
+
+**Third round: unscii's two fixed sizes weren't enough, so a custom
+scalable font replaced it.** Reported back from hardware: the button font
+(the whole-app default from `theme_create_button()`, `unscii_16`) reached
+the sides of the Day/Week Events tabs, and the grid font (`unscii_8`, from
+the wrap fix above) was too small to read comfortably. The request was
+specific -- buttons down one size, cells and the rest of the small-tier
+text up two -- which exposed the real limit of `unscii_8`/`_16`: LVGL's
+built-in version only ships in those two fixed sizes, nothing in between,
+so neither "down one" nor "up two" is actually satisfiable by picking
+between them. Worse, checked directly: jumping the grid to `unscii_16`
+outright to solve "too small" would have shrunk the flexible EVENT-name
+column from ~45 characters of headroom to ~6-7 before ellipsizing --
+trading one readability problem for a worse one, not fixing anything.
+
+Solved with a real scalable font instead of another guess at which of two
+fixed sizes to pick:
+- **`assets/VT323-Regular.ttf`** (Peter Hull/The VT323 Project Authors,
+  SIL Open Font License 1.1, free to embed) -- a monospace font modeled on
+  vintage terminal displays, sourced from Google Fonts' own
+  `github.com/google/fonts` repo. Converted to two custom LVGL bitmap
+  fonts via `npx lv_font_conv` (Node/npm were already available locally):
+  `src/fonts/lv_font_vt323_22.c` and `src/fonts/lv_font_vt323_28.c`
+  (`--size 22`/`28`), both over the full printable ASCII range
+  (`0x20-0x7E`) with kerning dropped (monospace doesn't need it). Declared
+  in a new `include/fonts.h`, which also documents the exact regeneration
+  command.
+  **First attempt rendered every glyph as a solid rectangle on real
+  hardware** -- generated with `--bpp 4` (antialiased) and RLE compression
+  left on (`lv_font_conv`'s default), this project's LVGL build wasn't
+  decoding that compressed bitmap format correctly. Fixed by regenerating
+  both with `--bpp 1 --no-compress --no-prefilter` -- the exact settings
+  LVGL's own built-in `unscii` fonts ship with (confirmed from
+  `lv_font_unscii_16.c`'s own header comment) and which render correctly
+  in this project. Costs the antialiasing `--bpp 4` would have given, but
+  crisp 1-bit edges fit a retro/VGA look at least as well anyway.
+- **Why this actually solves the tradeoff, not just "a third size":**
+  checked directly from each generated font's glyph table (`adv_w`, LVGL's
+  1/16px fixed-point advance width) -- VT323's letterforms are
+  proportioned taller than they are wide, so its advance width per pixel
+  of visual height is much narrower than unscii's square 1:1 glyphs.
+  `vt323_22` has a 19px line height (more than double `unscii_8`'s 8px --
+  a real readability jump) but only an ~8.8px advance width (`adv_w=141`),
+  barely wider than `unscii_8`'s 8px. `vt323_28` (22px line height,
+  ~11.2px advance width, `adv_w=179`) reads clearly bigger than
+  `unscii_16` ever did on a button without touching the sides, because
+  it's still narrower per character than unscii_16's 16px.
+- **`vt323_22`** replaces every previous `unscii_8` use: the event grid's
+  cells and header row, the day-separator label, `status_label`,
+  `no_server_message`, and the boot splash's boot-log/copyright text.
+  `col_time_w`/`col_act_w`/`col_fcst_w`/`col_prev_w` (`calendar_view.cpp`)
+  widened modestly (70 -> 85/80/80/85; `col_ccy_w` unchanged at 55, already
+  had room) for the slightly wider advance width, computed against
+  worst-case content ("Tentative", an 8-digit value, PREV plus a revision
+  `*`) -- `LV_LABEL_LONG_DOT`'s ellipsis fallback (added during the wrap
+  fix) still covers anything past that budget.
+- **`vt323_28`** replaces `theme_create_button()`'s per-button default
+  (`unscii_16` before this) -- fixes every button app-wide in the one
+  place, same as the earlier button-font fix. `settings_screen.cpp`'s
+  `make_menu_button()` no longer needs its own explicit font override to
+  look bigger than a plain button -- that was pointing at the exact same
+  `unscii_16` the default itself now used, a redundant no-op once the
+  earlier button-font fix landed; removed rather than left as dead code
+  pointing at a font that no longer exists in this codebase.
+- **Untouched by this pass, on purpose:** every screen title *except* the
+  calendar screen's own (see below) stays on `unscii_16` -- not part of
+  what was reported broken, and changing them wasn't asked for. The WiFi
+  status icon, settings gear, and WiFi-setup password eye-toggle stay on
+  Montserrat, same reasoning as before -- VT323 is a text font like
+  unscii, no `LV_SYMBOL_*` icon glyphs either.
+
+Compiles clean (RAM 35.3%, Flash 70.0%).
+
+**Two more rounds of hardware feedback, both resolved:**
+1. **Every glyph rendered as a solid rectangle**, not the actual
+   letterform -- see `fonts.h`'s doc comment. Root cause: the first
+   conversion used `--bpp 4` (antialiased) with RLE compression left on
+   (`lv_font_conv`'s default), and this project's LVGL build doesn't
+   decode that compressed bitmap format correctly. Fixed by regenerating
+   both fonts with `--bpp 1 --no-compress --no-prefilter` -- confirmed
+   from `lv_font_unscii_16.c`'s own header comment that these are the
+   exact settings LVGL's built-in fonts ship with, and unlike the custom
+   ones, those always rendered correctly here. Costs the antialiasing
+   `--bpp 4` would have given; crisp 1-bit edges fit a retro/VGA look at
+   least as well anyway.
+2. **Readable, but asked to read "just a bit more."** `vt323_22`
+   (19px line height) regenerated at size 26 instead (22px line height,
+   `adv_w=166` -> ~10.4px advance width, up from ~8.8px) -- renamed
+   `lv_font_vt323_26` throughout (file, symbol, `fonts.h` declaration,
+   every call site) rather than leave a `_22` name pointing at a 26px
+   font. `col_time_w`/`col_act_w`/`col_fcst_w`/`col_prev_w` widened again
+   for the new advance width (85/80/80/85 -> 100/90/90/95;
+   `col_ccy_w` still unchanged at 55).
+
+   Also fixed in the same pass: the calendar screen's own "UPCOMING
+   EVENTS" title, reported as reading small next to the WiFi/gear icons
+   sharing its top strip -- and since those icons anchor to the top-right
+   corner rather than the title's own position, the title had to change
+   rather than the layout. Bumped from `unscii_16` to `vt323_28` (the
+   button tier) -- a deliberate one-off scoped to just this title, not an
+   app-wide title bump, since it's the only title that shares a row with
+   icons in the first place.
+
+Compiles clean (RAM 35.3%, Flash 69.9%).
+
+**Reported back from hardware: the title change above wasn't visible at
+all** -- not "still too small," but pixel-identical to before the edit,
+even after a clean rebuild and reflash (confirmed the object code was
+current: a no-op rebuild showed nothing left to recompile). Left as an
+open question rather than guessed at further -- see the next entry, which
+incidentally re-tests this same code path with a completely different
+font.
+
+**VT323 dropped for Space Mono, picked directly by the user from a
+side-by-side comparison.** Rather than keep iterating blind on font
+choice, built an HTML comparison page (self-contained, fonts embedded as
+base64 data URIs) showing 8 candidates -- VT323, Share Tech Mono, Space
+Mono, IBM Plex Mono, Courier Prime, DotGothic16, Silkscreen, Major Mono
+Display, sourced from Google Fonts' own `github.com/google/fonts` repo --
+each rendering the same three lines (a real grid row, a digit-legibility
+torture test, a button label) at the actual on-device sizes. Prompted by
+the user separately flagging that VT323's `0` and `2` read as too similar,
+which the torture test line was built specifically to surface across
+every candidate at once. User picked Space Mono.
+
+`assets/VT323-Regular.ttf` and `src/fonts/lv_font_vt323_26.c`/`_28.c`
+removed; replaced with `assets/SpaceMono-Regular.ttf` (Colophon
+Foundry/Google Fonts, SIL OFL 1.1) and `src/fonts/lv_font_spacemono_18.c`/
+`_20.c`, generated with the same proven-safe settings
+(`--bpp 1 --no-compress --no-prefilter`) established during the VT323
+rectangle-rendering bug above. `fonts.h` rewritten (declarations, doc
+comment, regeneration command) rather than patched -- see its current
+comment for the full font history and exact metrics.
+
+Space Mono's letterforms are close to square, unlike VT323's noticeably
+taller-than-wide proportions -- anticipated directly by the user before
+even trying it ("I don't think we will be able to keep the same size").
+Calibrated the same way as VT323 (checking `adv_w` from a range of test
+conversions): landed on 18px for the grid tier (19px line height, `adv_w=176`
+-> 11.0px advance width) and 20px for the button/title tier (21px line
+height, `adv_w=196` -> 12.25px advance width) -- both a step down in pixel
+size from the VT323 tiers (26px/28px) for a comparable visual weight,
+confirming the expected tradeoff. Every `vt323_26`/`vt323_28` reference
+renamed to `spacemono_18`/`spacemono_20` throughout (`calendar_view.cpp`,
+`main.cpp`, `theme.cpp`), including the button-tier calendar-screen title
+from the entry above -- this reflash also serves as a second, independent
+test of whether that title actually updates, since it's now a completely
+different font family rather than a bigger size of the same one.
+
+`col_time_w`/`col_act_w`/`col_fcst_w`/`col_prev_w` widened again for the
+wider advance width (100/90/90/95 -> 105/95/95/100; `col_ccy_w` still
+unchanged at 55, "USD" never got close to that budget under any font
+tried so far).
+
+Compiles clean (RAM 35.3%, Flash 69.9%).
+
+**Reported back: cells look good, but the selected tab button reads as
+"washed out," and the title still doesn't clearly look like a different
+font -- "could just be it's small and grainy."** Both trace to the same
+choice: the initial Space Mono conversion used `--bpp 1` (no
+antialiasing), matching unscii's settings exactly out of caution left over
+from the earlier rectangle-rendering bug -- but that bug was specifically
+about *compression*, never actually about antialiasing itself; `--bpp 4`
+had never been tried uncompressed. Regenerated both fonts `--bpp 4
+--no-compress --no-prefilter` (confirmed `bitmap_format=0`, same
+uncompressed layout as before, just with grayscale antialiasing data now
+present) -- smooths the jagged 1-bit edges causing the "grainy" read, and
+should make thin dark-on-amber strokes (the selected tab's text/background
+swap) read as an actual soft-edged glyph instead of a harsh single-pixel
+line that optically looks weaker than the same weight reads light-on-dark.
+`adv_w`/line-height are unchanged (font metrics, not bitmap depth), so no
+column-width changes needed this round. Compiles clean (RAM 35.3%, Flash
+70.1% -- antialiasing bitmap data is larger than 1-bit, expected).
+
+**Title still didn't read as bigger, reported once more.** Two attempts at
+sharing an existing tier (`unscii_16`, then `spacemono_20`, the button
+size) both landed as "doesn't look changed." Rather than try a third
+shared tier, gave the title its own dedicated size: `spacemono_32`
+(33px line height, `adv_w=313` -> 19.6px advance width), used nowhere
+else. At `x=20, y=10` this puts the title's bottom edge around `y=43`,
+comfortably clear of the Day/Week tabs starting at `y=58`. Compiles clean
+(RAM 35.3%, Flash 70.6%).
+
+**Calendar screen's WiFi icon recolored off the boot splash's neon
+green.** `THEME_COLOR_SPLASH_TERMINAL_GREEN` was sampled from the boot
+splash artwork specifically (see its own doc comment in `theme.h`) and
+reused for the calendar screen's WiFi icon too, since both were driven by
+the same `apply_pending_wifi_icon_state()` call with one shared color per
+state -- reported back as reading too bright against the calendar
+screen's amber theme. `main.cpp`'s `apply_pending_wifi_icon_state()` now
+passes different colors to the two icons for "connected"/"connecting":
+the boot splash keeps green/dim-grey (matches its own artwork), the
+calendar icon gets `THEME_COLOR_AMBER`/`_AMBER_DIM` (matches its own
+screen's text). Both keep the same red "disconnected" color/strike --
+that's a status signal, not a theme choice, and reads the same either
+way. Compiles clean (RAM 35.3%, Flash 70.6%). **Not yet seen on real
+hardware** as of this writing.
+
+**Day-separator text had no space between weekday and month** ("FriJul
+31"), noticed directly on the display and asked about rather than assumed
+broken. Root cause was server-side, in `calendar_api.py` -- see
+`LXC/README.md`'s Maintenance notes for the full writeup (a BeautifulSoup
+`get_text()` concatenation quirk against Forex Factory's actual nested
+markup, confirmed directly against the live site). `alert_manager.cpp`'s
+`parse_event_timestamp()` had its own matching fix: it used to skip
+exactly 3 characters to get past the weekday ("MonJul 27" ->
+`event.day.substring(3)` -> "Jul 27"), which the backend fix would have
+silently broken (the corrected "Mon Jul 27" would leave a leading space
+before "Jul", shifting the parse and making every event's day/time
+unparseable) -- changed to skip to the first space instead, which works
+correctly against both the old and new backend format. Compiles clean
+(RAM 35.3%, Flash 70.6%). **Backend fix requires redeploying
+`calendar_api.py` to the LXC container** (`pct enter <ctid>`, then
+`update` -- see `LXC/README.md`'s Updating section) -- not something
+this session can do directly.
+
+**Grid widened to shift ACT/FCST/PREV right, PREV asked to line up under
+the WiFi icon.** First attempt just widened `list`/`header` from 760 to a
+hand-picked 780 (flush to the screen's right edge) -- reported back as
+"shifted some, but not all the way." Rather than guess a third pixel
+value, computed the grid's width at runtime instead: `build_events_ui()`
+now calls `lv_obj_update_layout(wifi_icon_label)` (forces its
+`lv_obj_align()` to resolve immediately -- alignment is otherwise lazily
+applied on the next layout pass, not synchronous) and reads its actual
+rendered right edge via `lv_obj_get_coords()`, then sizes `header`/`list`
+so the grid's own right edge matches it exactly. `make_header_row()`
+gained a `width` parameter instead of a hardcoded constant, since it now
+needs whatever `build_events_ui()` computes rather than a fixed number.
+This should be correct regardless of font metrics, rather than another
+hand-tuned guess. Compiles clean (RAM 35.3%, Flash 70.6%). **Reported back:
+"right back under the gear icon"** -- still not landing exactly where
+intended. Rather than keep hand-guessing the grid's absolute right edge a
+fourth time with no hardware feedback in the loop, the request that
+followed this report shifted to something more concretely implementable
+(below) -- the exact-icon-alignment question is left open; `grid_width`'s
+computation (still keyed off `wifi_icon_label`'s position) wasn't touched
+again in the work below, since none of it depends on exactly where the
+grid's right edge lands, only on how the width it has is divided up
+internally. Worth another look with the user actually watching, not
+another blind guess.
+
+## Overnight worklist (four requests, done unattended -- see the checklist at the end)
+
+Requested as an explicit list to complete without stopping for
+confirmation (no hardware access until morning), with an explicit
+instruction not to ask clarifying questions. Where a judgment call was
+needed, the reasoning is written out below so it can be revisited/reversed
+easily if it guessed wrong.
+
+**1. "PREV right justified, FCST/ACT not too wide past their biggest
+numbers, all the space I can get for EVENT."** Previously ACT/FCST/PREV
+were fixed widths (95/95/100) sized for a worst case that's rarely
+actually all on screen at once. Replaced with `compute_column_layout()`
+(`calendar_view.cpp`): scans whatever `events` actually came back from
+the current fetch, measures the longest `actual`/`forecast`/`previous`
+value (the `previous` measurement includes the trailing `*` a revised
+value gets), and sizes each column to `chars * 11px + 10px` -- 11px is
+spacemono_18's confirmed advance width (`adv_w=176` in 1/16px
+fixed-point, see `fonts.h`), 10px is a small padding margin so tight-fit
+text doesn't touch its neighbors. Never narrower than the column's own
+header text ("ACT"/"FCST"/"PREV"), so the header can't itself get
+clipped by an unusually narrow data column (e.g. a range with no actual
+values released yet). Since EVENT is the row's only `flex_grow` column,
+narrower ACT/FCST/PREV automatically hands EVENT the freed space --
+nothing separate needed to "give EVENT more room."
+
+`PREV` right-justified (`lv_obj_set_style_text_align(label,
+LV_TEXT_ALIGN_RIGHT, 0)`, both the header label and each row's) -- reads
+like a real table's numeric column, flush against the grid's own right
+edge, rather than left-hanging text in a now-tightly-sized column. ACT/FCST
+weren't asked to be right-justified and were left as-is (left-aligned).
+
+Because column widths now depend on the *current* fetch (and, see below,
+the current currency filter), the header can no longer be a build-once
+static row -- `make_header_row()` became `rebuild_header_row()`: deletes
+any existing `header` object and builds a fresh one every call, tracked
+in a new namespace `header` pointer (parallel to `list`, which already
+worked this way). Called once in `build_events_ui()` with fallback widths
+(before the first fetch resolves, so the screen isn't blank while
+"Loading events..." shows), then again from `populate_events()` every
+single refresh with the real measurement. Header rebuild cost is trivial
+(7 objects) next to the up-to-100+ row list that already gets fully
+rebuilt the same way every refresh.
+
+**2. "Drop CCY if only 1 currency is selected; EVENT starts there. Most
+people are going to use it for USD."** `refresh_events()` now also calls
+`calendar_client_get_filters()` (a small extra `/filters` GET each
+refresh, alongside the existing `/calendar` fetch) and checks
+`filters.currency_codes.size() == 1`. If so, `show_ccy=false` flows
+through to both `rebuild_header_row()` and every `make_event_row()` call
+for that refresh, and the CCY label is skipped entirely -- not shrunk,
+not blanked, just never created, so EVENT's `flex_grow` absorbs that
+space exactly like it does for ACT/FCST's freed width above. Defaults to
+showing CCY (the previous, safe behavior) if the filter fetch itself
+fails, matching this file's existing fallback direction elsewhere. This
+re-evaluates on every refresh (tab switch, periodic poll, post-Settings
+return), so changing the currency filter in Settings and coming back
+updates it without needing a reboot.
+
+**3. "All EVENT cells word-wrapped by default, not the Week tab's `...`
+after visiting it once."** The `add_label()` lambda in `make_event_row()`
+used `LV_LABEL_LONG_DOT` (ellipsis) for the flex-grow EVENT column --
+added earlier as the fix for a real bug (a *fixed*-height row plus
+unbounded wrap could blow out past the row's height and corrupt the
+display, confirmed on hardware -- see the "wraps the cells" writeup
+above). Changed to `LV_LABEL_LONG_WRAP`, made safe to re-enable by the
+row-height change below rather than reverting into the same bug.
+Fixed-width columns (TIME/CCY/ACT/FCST/PREV) still ellipsize -- short
+single-value cells, not free text, so multi-line wrapping would look
+wrong there even though the row can now grow to fit it.
+
+**Row height changed from a fixed 56px to `LV_SIZE_CONTENT`**, specifically
+to make wrap safe to turn back on: a row that can grow to fit wrapped
+text can't overflow it. LVGL sizes a content-fit flex container to its
+tallest child -- `impact_bar`'s own fixed 40px height sets a sensible
+floor for an ordinary single/double-line row (both comfortably under 40px
+at spacemono_18's 19px line height), and a row wrapping to 3+ lines
+simply grows taller than that instead of clipping, with `impact_bar`
+staying its original size, vertically centered. Added explicit
+`pad_top`/`pad_bottom` (6px each) to the row, since content-fit sizing
+with zero padding would hug the text with no breathing room at all.
+
+Wasn't in the original three-item list but follows directly from item 3 --
+without it, turning wrap back on would have reintroduced the exact bug it
+was originally added to fix, just with a different trigger (a single very
+long event name instead of many rows built too fast). Flagged here as a
+judgment call made without hardware to check it against, not something
+explicitly requested.
+
+Compiles clean (RAM 35.3%, Flash 70.6%). **None of this has been seen on
+real hardware** -- built and self-reviewed only (checked for stale
+references to renamed functions/constants, confirmed the row's TIME label
+is still always child index 1 regardless of whether CCY is present, since
+`update_next_event_row()`/`unhighlight_row()` depend on that), since no
+hardware access was available overnight. See the checklist below for what
+to verify first.
+
+**Overnight checklist (verify each on hardware, then check off):**
+- [x] PREV reads right-justified, flush against the grid's right edge --
+      **confirmed on hardware**, and also now lines up under the WiFi
+      icon (the "under the gear icon instead" report from before this
+      worklist resolved itself once these changes landed -- not
+      separately touched).
+- [x] ACT/FCST columns are visibly narrower than before, roughly hugging
+      their actual widest value rather than a lot of empty padding --
+      confirmed, but see the immediate follow-up fix just below.
+- [ ] EVENT column visibly wider than before (more of a long event name
+      fits before truncating)
+- [ ] With exactly one currency selected in Settings -> Filters, the CCY
+      column is gone entirely and EVENT starts where it used to be
+- [ ] With two or more currencies selected, CCY still shows as before
+- [ ] Day tab: event names wrap across multiple lines instead of showing "..."
+- [ ] Week tab: same -- wraps instead of ellipsizing, including after
+      switching away to Day and back (the original inconsistency reported)
+- [ ] Rows with wrapped (multi-line) event names don't visually overlap
+      the row below them -- confirms the row auto-height actually works
+      as intended
+- [ ] No recurrence of the frame-shift/pixelation display bug from
+      Milestone 8, especially on Week (many rows, most likely to have a
+      long name wrap to 3+ lines)
+
+**Immediate follow-up, same session:** ACT/FCST's *values* were still
+left-aligned within their new (narrower) columns -- only PREV had actually
+been right-justified the first time through, per how the original request
+was worded ("I need the PREV right justified, with the FCST and ACT
+columns not too wide"). Reported back as reading misaligned against their
+own headers once the columns were narrow enough for the difference to be
+obvious. Both the ACT/FCST data labels and their header labels
+(`add_label`/`add_header_label` calls in `make_event_row()`/
+`rebuild_header_row()`) now pass `right_align=true`, matching PREV.
+Compiles clean (RAM 35.3%, Flash 70.6%). Not yet re-confirmed on hardware
+as of this specific change.
+
+**Reported still misaligned after that fix, before it had actually been
+flashed yet.** Investigated without hardware access (no native compiler
+available in this environment to build a literal LVGL render test):
+checked the live backend directly for hidden whitespace in
+`actual`/`forecast`/`previous` (`repr()` against the raw JSON -- none
+found), then traced LVGL's own alignment code
+(`lv_label.c`'s `calculate_x_coordinate()`: for `LV_TEXT_ALIGN_RIGHT`,
+`x += label_width - text_pixel_width`) to confirm the already-applied
+`right_align=true` fix above is correct against LVGL's actual
+implementation, not just this project's assumption about how it should
+work. No bug found in either the data or the alignment code -- most
+likely explanation is the report described the build from before that
+fix, not a failure of the fix itself. Still **not confirmed on real
+hardware**.
+
+**Screensaver: researched, not built.** Asked about feasibility (idle
+detection, wake-on-touch, time-of-day wake, a custom candlestick-chart
+screensaver) -- explicitly deferred to a future session rather than
+built tonight, so this is a research note, not a change:
+- Idle detection: `lv_display_get_inactive_time(NULL)`, wake-on-touch is
+  automatic (any touch already resets it). Time-of-day wake is
+  straightforward given NTP is already wired up (`configTzTime()` in
+  `main.cpp`).
+- Not really solving a burn-in problem on this hardware (RGB TFT, not
+  OLED/plasma) -- would be a visual flourish, not hardware protection.
+- LVGL's built-in `lv_chart` widget has no candlestick/OHLC series type
+  (checked directly: only `LINE`/`BAR`/`SCATTER`) -- a real candlestick
+  chart needs either `lv_canvas` (a manually-allocated pixel buffer --
+  confirmed `LV_USE_CANVAS`/`LV_USE_CHART` both default-enabled given
+  this project's build flags, but a half-screen-sized RGB565 canvas
+  alone is ~456KB, well over this chip's ~327KB internal RAM, so it'd
+  need a PSRAM-backed buffer) or plain LVGL objects (a colored rect per
+  candle body + a thin rect per wick, positioned programmatically --
+  recommended instead, since it reuses the exact pattern `impact_bar`
+  already uses successfully in the event grid, with zero extra pixel
+  buffer needed).
+- The real risk if this gets built: this display only redraws in full
+  800x480-frame mode (~66ms per invalidation, confirmed earlier during
+  the countdown-stall investigation) -- an animated screensaver that
+  updates too often would reintroduce that exact class of bug. Whatever
+  gets built needs the same discipline already established for the
+  countdown (update on a slow tick, skip the redraw if nothing changed).
+
+If sound is ever wanted again, `CONFIG_LCD_RGB_RESTART_IN_VSYNC` (via the
+combined `arduino, espidf` build mode explored and abandoned above) is
+still the documented fix for genuine RGB-LCD DMA contention in general --
+that avenue wasn't invalidated by this discovery, it just turned out to
+be solving a problem this project didn't actually have.
 
 ## Roadmap (from the brief, plus Milestones 4 and 6 which weren't in it)
 
@@ -755,7 +1491,7 @@ sequence, not a third parallel guess.
 5. ✅ Calendar UI with static/mock data (dark/amber styling, layout)
 6. ✅ Settings screen: calendar filters (impact/currency/columns, via Forex Factory) + WiFi reconfigure (not in the original brief)
 7. ✅ Real data fetch, wired to `LXC/calendar_api.py`'s `/calendar` endpoint (day/week tabs, periodic poll, Settings-triggered refresh)
-8. ✅ Countdown/alert logic (10-min countdown, 5-min red-folder sound, +30s post-event refresh) + actual/previous value coloring
+8. ✅ Countdown/alert logic (10-min countdown, +30s post-event refresh) + actual/previous value coloring. Sound alert attempted, reliably corrupted the display, dropped -- see write-up above.
 9. Retro-style screensaver, to consider at the very end. The CrowPanel is
    an IPS LCD, not OLED, so it isn't at risk of the classic permanent
    pixel burn-in OLED/plasma panels get -- this is about backlight wear
