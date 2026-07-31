@@ -205,6 +205,24 @@ themselves being blanked.
   (`"icon--ff-impact-" in c`) instead, which correctly matches on the
   full-string call bs4 also makes. Verified directly against the live site
   afterward (real 1/2/3 distributions, not all-0).
+- `/calendar`'s `day` field used to come back glued together with no space
+  between the weekday and the month ("FriJul 31" instead of "Fri Jul 31"),
+  reported from the ESP32 firmware's own display of it. Root cause: Forex
+  Factory's `calendar__date` cell nests the weekday and "Mon DD" in
+  separate sibling elements with no whitespace text node between them
+  (`<span class="date">Fri<span>Jul 31</span></span>`), and
+  `date_cell.get_text(strip=True)` concatenates text from separate
+  elements with nothing in between -- confirmed directly against the live
+  markup. Fixed with `get_text(separator=" ", strip=True)`, then
+  `re.sub(r"\s+", " ", ...)` to collapse any resulting double spaces
+  rather than assume the exact tag structure holds forever. Verified
+  directly against the live site's actual markup (not just against the
+  API's own output) before considering it fixed. The ESP32 firmware's
+  `alert_manager.cpp` (`parse_event_timestamp()`) parses this same field
+  to build countdown/refresh timestamps -- its weekday-skip logic changed
+  from a hardcoded 3-char substring to "skip to the first space" to match,
+  since a hardcoded skip would silently break the moment this field
+  gained a space.
 - A cache layer would be a good next step if the API is polled frequently.
 
 ## License

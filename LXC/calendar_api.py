@@ -51,6 +51,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 import json
 import logging
+import re
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("calendar_api")
@@ -311,7 +312,16 @@ def parse_calendar(html: str) -> list[dict]:
             # events aren't repeated).
             date_cell = row.find("td", {"class": "calendar__date"})
             if date_cell is not None:
-                day_text = date_cell.get_text(strip=True)
+                # The weekday abbreviation and "Mon DD" live in separate
+                # sibling elements with no whitespace text node between
+                # them in Forex Factory's markup -- get_text(strip=True)
+                # alone concatenates them with nothing in between
+                # ("FriJul 31", confirmed directly against the live site).
+                # separator=" " fixes that but can double up wherever a
+                # real space already existed between fragments, so collapse
+                # runs of whitespace down to one afterward rather than
+                # assume the exact tag structure.
+                day_text = re.sub(r"\s+", " ", date_cell.get_text(separator=" ", strip=True)).strip()
                 if day_text:
                     current_day = day_text
 
