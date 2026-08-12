@@ -1476,11 +1476,253 @@ built tonight, so this is a research note, not a change:
   gets built needs the same discipline already established for the
   countdown (update on a slow tick, skip the redraw if nothing changed).
 
+**The frame-shift/pixelation glitch is back, and this time the `[stall]`
+logging cleared the app of suspicion.** Reported again from hardware, with
+the serial log captured right around the actual occurrence for the first
+time (earlier captures kept missing it) -- every `[stall]` line nearby was
+in the same 55-81ms range this project has seen constantly, including on
+refreshes with no visible glitch at all. No outlier, nothing pointing at a
+specific blocking call. That rules out application-level blocking as the
+cause here, which is what all of this project's fixes so far (the
+per-row/per-delete yielding, the countdown label-invalidation fix) have
+been targeting -- the remaining cause is lower-level than anything
+`lv_timer_handler()` scheduling can reach.
+
+Checked whether `CONFIG_LCD_RGB_RESTART_IN_VSYNC` (this project's own
+documented fix for genuine RGB-LCD DMA contention, see the
+`bounce_buffer_size_px` comment in `Bus_RGB.cpp`) is reachable any other
+way than the abandoned ESP-IDF Kconfig build mode: confirmed directly
+against this exact build's own vendored header
+(`esp_lcd_panel_rgb.h`, from `framework-arduinoespressif32-libs`) that
+`esp_lcd_rgb_panel_config_t.flags` has no such bit -- it's genuinely a
+compile-time Kconfig-gated behavior inside the driver implementation, not
+a runtime toggle, so there's still no way to reach it short of that
+abandoned build mode.
+
+That same header search turned up something new, though:
+`flags.bb_invalidate_cache` -- a real runtime bit on the exact same
+`esp_lcd_rgb_panel_config_t` this project already configures, previously
+left unset (defaulting to 0 via the struct's `= {}` zero-init). Per its
+own doc comment, it invalidates the CPU cache's view of data GDMA just
+read into the bounce buffer -- only meaningful because bounce-buffer mode
+is already on (`fb_in_psram`/`bounce_buffer_size_px` above); without it,
+nothing sits between GDMA and PSRAM for a cache to be stale about. A
+plausible, previously-untested explanation for an intermittent visual
+desync that isn't explained by any single slow function call: a narrow
+cache-coherency window where the display pipeline could read stale data
+that GDMA had already overwritten. Enabled in `Bus_RGB.cpp`, right after
+`fb_in_psram`. Compiles clean (RAM 35.3%, Flash 70.6%). Cheaper and lower-
+risk to try first than reopening the ESP-IDF combined build mode -- a
+one-flag runtime change on infrastructure already in place, no
+build-system change required. **Not yet confirmed on hardware** -- next
+step is exactly the same wait-and-watch process that caught the glitch
+this time (keep the serial monitor running, note whether it recurs at
+all, and if it does, whether it's now rarer/gone or unchanged).
+
+**`bb_invalidate_cache` didn't help -- reported back after another clean
+capture** (same unremarkable 55-81ms `[stall]` range, nothing correlated,
+two clean passes in a row now). Rules out cache coherency alongside
+application-level blocking; both of this project's own instrumented
+layers have now been cleared. Also notable: `[stall]` logging can only
+ever catch a *slow function call* -- a genuine VSYNC/DMA desync doesn't
+need anything to block the CPU long enough to cross even a tight
+threshold, since it's the panel driver's own internal read pointer losing
+sync with the timing signal, plausibly from a bus-arbitration hiccup
+(WiFi's own DMA traffic, for instance) far too brief to ever show up in a
+`millis()`-based measurement. Consistent with everything ruled out so far
+pointing at something below what this project's own diagnostics can see.
+
+**Next experiment, chosen over reopening the ESP-IDF build mode
+immediately:** `bounce_buffer_size_px` bumped from `*40` to `*80` (see
+its own updated comment in `Bus_RGB.cpp` -- also corrected there: `*40`
+was never actually confirmed to matter, since it was originally a fix
+attempt against the *misdiagnosed* I2S-contention theory, not this
+glitch). Cheap, reversible, no build-system change. Compiles clean (RAM
+35.3%, Flash 70.6% -- unchanged, since the bounce buffer is a runtime
+heap allocation inside `esp_lcd_new_rgb_panel()`, not a static global the
+linker's own RAM figure accounts for; if `*80` is too aggressive for
+available internal RAM, that would show up as an obvious boot-time
+failure on first flash, not a subtle runtime symptom).
+
+**Predicted failure mode happened exactly as flagged: `*80` didn't
+boot.** Reverted immediately back to `*40` (confirmed-working; still
+includes `bb_invalidate_cache`, harmless on its own even though it didn't
+fix the glitch). This effectively closes off "just make the bounce
+buffer bigger" as a cheap lever -- internal SRAM on this chip is a small,
+already-committed budget (LVGL's own buffers, FreeRTOS task stacks,
+WiFi's stack, and the bounce buffer needing space for its own
+double-buffering all draw from the same pool), and `*40` is apparently
+already close to what's actually available, not conservative headroom.
+Smaller increments (`*50`/`*60`) remain technically available but
+weren't tried -- doubling was meant to be a decisive test, and it was:
+decisively no. Compiles clean (RAM 35.3%, Flash 70.6%). **Confirmed
+back to a bootable state on hardware** was the only thing actually
+verified here -- the glitch itself is exactly where it was before this
+detour: application-level blocking and cache coherency both ruled out,
+buffer size now also ruled out, and the two remaining options
+(reopening the ESP-IDF build mode, or accepting this as a known rare
+quirk) are unchanged from above.
+
 If sound is ever wanted again, `CONFIG_LCD_RGB_RESTART_IN_VSYNC` (via the
 combined `arduino, espidf` build mode explored and abandoned above) is
 still the documented fix for genuine RGB-LCD DMA contention in general --
 that avenue wasn't invalidated by this discovery, it just turned out to
 be solving a problem this project didn't actually have.
+
+**Separately, reported after reflashing the reverted (`*40`) firmware:
+WiFi connected initially (reached `loop()`, so `setup()`'s connect
+succeeded) but then dropped and stayed stuck on `loop()`'s "WiFi still
+down, retrying..." backstop, on a network with nothing else reported
+unusual. `wifi_on_event()` logged nothing about *why* it disconnected --
+only `ARDUINO_EVENT_WIFI_STA_DISCONNECTED` -> a boolean icon-state
+change, no detail. Switched to `WiFi.onEvent()`'s
+`arduino_event_info_t`-carrying overload and log
+`info.wifi_sta_disconnected.reason`/`.rssi` on that event -- the ESP-IDF
+WiFi stack's own disconnect reason code (auth failure, AP not found,
+beacon timeout, etc.) and signal strength at the moment of the drop,
+neither previously captured anywhere. Doesn't fix anything by itself
+(`loop()`'s blind retry-every-10s backstop is unchanged) -- purely
+diagnostic, same spirit as the `[stall]` logging above, so the *next*
+occurrence actually says something instead of just "still down."
+Compiles clean (RAM 35.3%, Flash 70.6%). **Not yet seen on real
+hardware.**
+
+**Third capture of the frame-shift glitch actually found something real.**
+A Week-tab refresh's first `populate_events row` `[stall]` logged 114ms --
+noticeably above the ~66-70ms baseline every other capture (including
+this one's own second line, 68ms) had shown so far. Root cause:
+`rebuild_header_row()` (called every single refresh since a few sessions
+ago, to keep ACT/FCST/PREV widths and CCY visibility current -- see the
+worklist entries above) deletes the old header and creates up to 7 new
+objects (the header container + TIME/CCY/EVENT/ACT/FCST/PREV labels) with
+*no yield of its own*. That whole backlog was silently bundling into
+whichever `lv_timer_handler()` call happened to run next -- the first row
+in the loop right below it -- inflating just that one call specifically,
+exactly matching the 114-then-68 pattern in the log. Fixed with one more
+`timed_timer_handler()` call, right after `rebuild_header_row()` and
+before the row loop starts, same pattern already used everywhere else in
+this function. Compiles clean (RAM 35.3%, Flash 70.6%). This is the
+first time one of these captures has actually shown a real outlier
+instead of routine noise -- **not yet confirmed fixed on hardware**, but
+unlike the previous two dead ends (cache coherency, bounce buffer size),
+this one has an actual, specific, previously-unaccounted-for burst of
+object creation to point to.
+
+**Fourth capture: glitch recurred with the header-rebuild fix in place,
+and this time the log is unambiguous -- the fix worked, but didn't help
+the glitch.** Every `[stall]` line in the capture (`clear_list_yielding`
+at 86/71/71/71ms, `populate_events header rebuild` at 69ms, `populate_events
+row` at 68ms x3) sits inside the routine 55-86ms range; no 114ms-style
+outlier this time, meaning the header-rebuild yield is doing exactly what
+it was added to do. The glitch still happened anyway. That makes three
+out of three real captures now where the visible glitch has no
+correlated slow `lv_timer_handler()` call to blame -- the one time a real
+outlier did show up (the 114ms capture above), fixing it didn't stop the
+glitch from recurring on a later, perfectly ordinary-looking capture.
+Combined with `bb_invalidate_cache` (cache coherency) and bounce buffer
+size both already ruled out, this closes off application-level blocking
+as the cause with about as much confidence as `[stall]` logging can ever
+provide -- see the "genuine VSYNC/DMA desync" note above on why this
+class of cause wouldn't show up in a `millis()`-based measurement at all.
+The two options from before stand unchanged: reopen the abandoned
+`arduino, espidf` combined build mode for
+`CONFIG_LCD_RGB_RESTART_IN_VSYNC`, or treat this as a known rare
+hardware-level quirk this project's own instrumentation can't reach.
+
+**Follow-up investigation into both options -- reading the vendored
+driver source itself, not just its header -- found the ceiling on what's
+actually reachable here, and it's lower than hoped.**
+
+Checked whether the chip itself can log the underlying hardware event:
+`esp_lcd_panel_rgb.c` has an `ESP_EARLY_LOGE(TAG, "LCD underrun")` line,
+gated behind `#if LCD_LL_EVENT_UNDERRUN`. Checked this exact build's own
+`hal/esp32s3/include/hal/lcd_ll.h`: that event bit is only defined for
+the P4 (`LCD_LL_EVENT_VSYNC_END`/`LCD_LL_EVENT_TRANS_DONE` are the only
+two on the S3). That log line is compiled out entirely on this chip --
+not a reachable lever.
+
+More significantly: the driver already runs its own automatic recovery
+every VBlank, independent of `CONFIG_LCD_RGB_RESTART_IN_VSYNC`.
+`lcd_rgb_panel_try_restart_transmission()` resets the GDMA channel
+whenever it detects `bb_eof_count < expect_eof_count` (a bounce-buffer
+underrun it tracked itself) -- the Kconfig flag only changes this from
+"restart when a mismatch is detected" to "restart unconditionally every
+single VBlank." Its own comment describes precisely this project's
+symptom as a known side effect of the *recovery itself*: "if this
+interrupt is late enough, the display will shift ... the single-frame
+desync this leads to is preferable to the permanent desync that could
+otherwise happen." In other words, the glitch may well be this exact
+safety net doing its job, not an unrecovered failure -- which means
+enabling the Kconfig flag would likely make an already-firing recovery
+path fire *more* often, not fix anything.
+
+Looked for a way to get a direct signal on that recovery path without
+the build-mode switch: `esp_lcd_rgb_panel_event_callbacks_t` has an
+`on_bounce_empty` hook, called every time the driver refills a bounce
+buffer. Checked `lcd_rgb_panel_fill_bounce_buffer()`'s actual gating,
+though, and it only invokes that callback when `panel->num_fbs == 0` (the
+driver's "no internal framebuffer, caller supplies pixels manually"
+mode) -- otherwise it takes the plain `memcpy()` path. `Bus_RGB.cpp` sets
+`panel_config.num_fbs = 2`, so `on_bounce_empty` would never fire in this
+project's configuration; registering it would be dead code, not a
+diagnostic. Ruled out without touching hardware.
+
+The actual recovery function is `static` and passes no event data even
+to the callbacks that do exist (`esp_lcd_rgb_panel_event_data_t` is an
+empty struct) -- there is no application-reachable way to instrument it.
+The only way to get a real signal (a counter, incremented inside
+`lcd_rgb_panel_try_restart_transmission()` itself) would be compiling the
+LCD driver component from source, which is the same combined
+`arduino, espidf` build mode again -- now valuable only for that counter,
+independent of whether `CONFIG_LCD_RGB_RESTART_IN_VSYNC` itself helps.
+
+Re-examined what that switch would actually take, per the abandoned
+`esp32-espidf-build-mode` branch's own account above. That branch is a
+stale pointer at an old `main` commit, not a WIP diff -- nothing to
+resume, the same steps would need repeating. Of the five issues hit last
+time, one is now moot (the repo's parent folder was renamed from
+`CRT Terminal` to `CRT-Terminal` for unrelated reasons since that
+attempt, which removes the CMake space-in-path blocker), two more have
+known one-line fixes (`CONFIG_FREERTOS_HZ=1000`,
+`CONFIG_AUTOSTART_ARDUINO=y`), but the fifth -- `NetworkClientSecure`
+(unused by this project; everything here is plain `http://`) failing to
+link with undefined references into `ssl_client.cpp` -- is exactly where
+the previous attempt stopped, still unresolved, with no known fix.
+
+**Decision: not pursuing the build-mode switch for now.** The linker
+issue that stopped the previous attempt is still open and would need
+fresh investigation to solve, and even solving it would very likely
+enable a flag that (per the analysis above) probably doesn't fix the
+actual glitch. Both diagnostic avenues this project's own code can reach
+(`[stall]` logging, `bb_invalidate_cache`) are exhausted, and the
+avenues that remain (chip-level underrun IRQ, `on_bounce_empty`) are
+confirmed dead ends on this hardware/configuration. This is being left
+as a known, rare, low-severity artifact of the RGB panel driver's own
+DMA-desync recovery path -- below the ceiling of what this project's
+instrumentation, or the currently-reachable ESP-IDF driver surface, can
+observe or influence.
+
+**Mitigation instead of a fix: reported directly that the glitch shows up
+shortly after a refresh specifically, and that constant refreshing isn't
+actually needed -- only around the times events are scheduled.** Can't
+fix the underlying DMA-desync-recovery mechanism (see above -- below the
+ceiling of what this project or the currently-reachable ESP-IDF driver
+surface can reach), but can reduce how often the display does the one
+thing that's been observed to trigger it: rebuilding the whole event list
+(`clear_list_yielding()` + `populate_events()`). `calendar_view_poll()`
+was refreshing unconditionally every 10 minutes (`calendar_view.cpp`) --
+up to ~144 rebuilds a day regardless of whether anything calendar-
+relevant was actually happening, each one a chance to trigger the glitch.
+`alert_manager_tick()` (`alert_manager.cpp`) already refreshes 30-40s
+after each event's own scheduled time independent of that periodic poll
+-- freshness right around real events was never depending on the 10-
+minute cadence to begin with. Lengthened `poll_interval_ms` to an hour:
+keeps a backstop for newly-added/updated events and rolling the Day tab
+over at midnight, while cutting unconditional rebuilds by roughly 6x.
+Compiles clean. **Not yet confirmed on hardware whether this
+meaningfully reduces how often the glitch is seen** -- it's a reduction
+in exposure to the trigger, not a fix for the trigger itself, so it's
+expected to make the glitch rarer, not eliminate it.
 
 ## Roadmap (from the brief, plus Milestones 4 and 6 which weren't in it)
 

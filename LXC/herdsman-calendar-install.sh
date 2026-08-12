@@ -40,6 +40,22 @@ chown -R herdsman:herdsman /opt/herdsman-calendar
 msg_ok "Installed Herdsman Calendar API"
 
 msg_info "Creating Service"
+# FLARESOLVERR_URL: required for calendar_api.py to fetch anything at all
+# (Forex Factory sits behind a Cloudflare JS challenge as of 2026-08 -- see
+# calendar_api.py's module docstring). Picked up here *if* it happens to
+# already be set in this script's environment (e.g. exported on the
+# Proxmox host before running install.sh, if build.func forwards it
+# through to this container-side script) -- not guaranteed, so this isn't
+# relied on as the primary way to set it. If it's empty, the service still
+# gets created and started (so the rest of this install completes
+# normally), just without that line -- the clear post-install message
+# below covers adding it either way, since there's no way to prompt
+# interactively this deep into a piped `curl | bash` execution without
+# risking breaking the whole non-interactive install flow.
+FLARESOLVERR_ENV_LINE=""
+if [[ -n "${FLARESOLVERR_URL:-}" ]]; then
+  FLARESOLVERR_ENV_LINE="Environment=FLARESOLVERR_URL=${FLARESOLVERR_URL}"
+fi
 cat <<EOF >/etc/systemd/system/herdsman-calendar-api.service
 [Unit]
 Description=Herdsman Trading Terminal - Economic Calendar API
@@ -51,6 +67,7 @@ Type=simple
 User=herdsman
 WorkingDirectory=/opt/herdsman-calendar
 Environment=PATH=/opt/herdsman-calendar/venv/bin
+${FLARESOLVERR_ENV_LINE}
 ExecStart=/opt/herdsman-calendar/venv/bin/uvicorn calendar_api:app --host 0.0.0.0 --port 8080
 Restart=on-failure
 RestartSec=5
@@ -66,3 +83,13 @@ msg_ok "Created Service"
 motd_ssh
 customize
 cleanup_lxc
+
+if [[ -z "${FLARESOLVERR_URL:-}" ]]; then
+  echo -e "${YW}NOTE: FLARESOLVERR_URL isn't set -- the calendar API can't fetch"
+  echo -e "anything without it (Forex Factory requires solving a Cloudflare"
+  echo -e "challenge first; see LXC/README.md). Set it up:${CL}"
+  echo -e "  pct exec <ctid> -- systemctl edit herdsman-calendar-api"
+  echo -e "  # add under [Service]:"
+  echo -e "  #   Environment=FLARESOLVERR_URL=http://<your-flaresolverr-host>:8191"
+  echo -e "  pct exec <ctid> -- systemctl restart herdsman-calendar-api"
+fi

@@ -57,19 +57,27 @@ namespace lgfx
     // Bounce buffer mode (the frame buffer lives in PSRAM -- fb_in_psram
     // below -- and GDMA feeds the RGB panel from this smaller internal-SRAM
     // staging buffer instead of PSRAM directly) is what's supposed to
-    // insulate the panel from exactly this class of problem, but *10 rows
-    // wasn't enough margin: confirmed directly on hardware that it still
-    // corrupts (heavy pixelation, recoverable only with a manual reset)
-    // specifically while I2S audio is actively playing -- a much heavier,
-    // sustained DMA/PSRAM-bandwidth competitor than WiFi or an idle I2S
-    // peripheral. *40 gives roughly 4x the slack to absorb that contention
-    // before the buffer underruns. If this still isn't enough, the next
-    // lever is ESP-IDF's CONFIG_LCD_RGB_RESTART_IN_VSYNC/
-    // CONFIG_SPIRAM_FETCH_INSTRUCTIONS/CONFIG_SPIRAM_RODATA sdkconfig
-    // options -- unavailable here without switching platformio.ini's
-    // `framework = arduino` (prebuilt libraries) to the combined
-    // `arduino, espidf` build mode, a much bigger change than bumping this
-    // one runtime parameter.
+    // insulate the panel from exactly this class of problem. *10 -> *40
+    // rows was an early fix attempt against a "heavy pixelation, needs a
+    // manual reset" symptom -- that turned out to be a misdiagnosis (the
+    // real cause was this project's own UI code blocking the timer loop
+    // for too long, unrelated to buffer size at all -- see the Milestone 8
+    // writeup below), so *40 was never actually confirmed to matter one
+    // way or the other.
+    //
+    // *80 was tried next, as a cheap experiment against a *different*,
+    // still-unexplained "frame shift" glitch -- reverted immediately,
+    // confirmed on hardware to fail to boot at all. The bounce buffer is
+    // an internal-SRAM allocation (must be, for GDMA), and internal SRAM
+    // on this chip is a genuinely small, shared budget -- *80 (800px *
+    // 80 rows * 2 bytes/px = 128,000 bytes) was too much of it at once,
+    // most likely alongside whatever else this project already allocates
+    // there (LVGL's own buffers, FreeRTOS task stacks, WiFi's stack, the
+    // bounce buffer itself needing *two* copies for double-buffering,
+    // etc.). Back to the confirmed-working *40 -- if bounce buffer size
+    // is worth revisiting again, do it in smaller increments (e.g. *50,
+    // *60) with a real reason to think a specific size matters, not
+    // another large jump.
     panel_config.bounce_buffer_size_px = _cfg.panel->width() * 40;
     panel_config.dma_burst_size = 64;
     panel_config.hsync_gpio_num = _cfg.pin_hsync;
@@ -83,6 +91,26 @@ namespace lgfx
       panel_config.data_gpio_nums[index] = _cfg.pin_data[index];
     }
     panel_config.flags.fb_in_psram = 1;
+    // Untried lever, found while investigating a recurring "frame shift"
+    // glitch that showed no correlated application-level stall in this
+    // project's own instrumentation (see calendar_view.cpp/main.cpp's
+    // [stall] logging) -- ruling out a blocking call as the cause and
+    // pointing at something lower-level instead. This flag only exists
+    // because bounce-buffer mode is already on (fb_in_psram above): with
+    // it off, GDMA reads the CPU-cached framebuffer in PSRAM directly on
+    // every refresh with no cache involved in between, so there's nothing
+    // for this to invalidate. bb_invalidate_cache invalidates the CPU
+    // cache's view of the data GDMA just read into the bounce buffer,
+    // closing a real (if narrow) cache-coherency window where a stale
+    // cached read could otherwise slip in -- a plausible, previously
+    // untested explanation for an intermittent visual desync that isn't
+    // explained by any single slow function call. Cheaper and lower-risk
+    // to try than reopening the abandoned `arduino, espidf` combined
+    // build mode (needed for CONFIG_LCD_RGB_RESTART_IN_VSYNC, see the
+    // bounce_buffer_size_px comment above) -- this is a runtime flag on
+    // the exact same esp_lcd_rgb_panel_config_t already in use here, no
+    // build-system change required. Not yet confirmed on hardware.
+    panel_config.flags.bb_invalidate_cache = 1;
 
     esp_err_t result = esp_lcd_new_rgb_panel(&panel_config, &_panel_handle);
     if (result == ESP_OK)

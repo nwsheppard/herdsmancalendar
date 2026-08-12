@@ -12,8 +12,22 @@ infrastructure, not more, despite a well-known scraper for it
 (github.com/fizahkhalid/forex_factory_calendar_news_scraper) using Selenium:
 the calendar's event data is server-rendered in the initial HTML response
 (verified directly), so the same lightweight requests+BeautifulSoup approach
-already used for investing.com works here too -- no headless Chrome/chromedriver
-needed in the LXC container.
+already used for investing.com worked here too at the time -- no headless
+Chrome/chromedriver needed in the LXC container.
+
+That held until 2026-08: Forex Factory started sitting behind a Cloudflare
+JS challenge (confirmed directly -- a plain request, even with curl_cffi's
+TLS fingerprint spoofing, gets served challenges.cloudflare.com's
+interstitial instead of the calendar). No amount of header/fingerprint
+tuning gets past a real JS challenge, since nothing in this service
+actually executes the challenge script -- fetch_calendar_html() now routes
+through a self-hosted FlareSolverr instance (FLARESOLVERR_URL, required)
+instead of requesting forexfactory.com directly. FlareSolverr solves the
+challenge with a real headless browser and hands back the resulting HTML
+over a plain HTTP API, so this service itself still doesn't bundle a
+browser -- confirmed directly that the HTML it returns has the exact same
+calendar__* markup as before, so parse_calendar() below needed zero
+changes, only how the HTML gets fetched in the first place.
 
 This was a full replacement, not an added option: Forex Factory has no
 equivalent to investing.com's "category" concept (Employment/Inflation/
@@ -38,7 +52,12 @@ NOTE ON MAINTENANCE: this scrapes forexfactory.com's HTML, which can change
 without notice. If events stop appearing, the first thing to check is
 whether the CSS selectors below (WIDGET_TABLE_CLASS, calendar__* cell
 classes, IMPACT_ICON_SUFFIX_LEVELS) still match the live page — view-source
-the calendar URL and compare.
+the calendar URL and compare. If instead every request fails outright
+("Upstream fetch failed"/"FlareSolverr couldn't fetch the calendar"),
+check FlareSolverr itself first (is it running, is FLARESOLVERR_URL
+correct, can it still solve the challenge right now -- Cloudflare's own
+challenge mechanics can change too) before assuming this file's selectors
+are the problem.
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -75,12 +94,18 @@ app = FastAPI(title="Herdsman Trading Terminal Calendar API", lifespan=lifespan)
 
 BASE_URL = "https://www.forexfactory.com/calendar"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+# Required -- Forex Factory now sits behind a Cloudflare JS challenge
+# (confirmed directly, 2026-08: a plain request, even with curl_cffi's TLS
+# fingerprint spoofing, gets served challenges.cloudflare.com's interstitial
+# instead of the calendar -- see fetch_calendar_html()). No compiled-in
+# default, same reasoning as FILTERS_DIR/the ESP32's calendar server
+# address elsewhere in this project: a FlareSolverr instance's address is
+# specific to whoever's running this, not something safe to guess at.
+# https://github.com/FlareSolverr/FlareSolverr -- a small self-hosted proxy
+# that solves the challenge with a real headless browser and hands back the
+# resulting HTML over a plain HTTP API, so this service itself still
+# doesn't need to bundle a browser.
+FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "").rstrip("/")
 
 # --- Filters (impact level + currencies), user-configurable via /filters ----
 
@@ -218,17 +243,50 @@ def fetch_calendar_html(cal_type: str) -> str:
     # Forex Factory accepts literal "today"/"this" aliases directly (verified
     # directly) -- no need to compute or pass an actual date string.
     param = "day=today" if cal_type == "day" else "week=this"
+    url = f"{BASE_URL}?{param}"
 
-    # Forex Factory doesn't sit behind Cloudflare bot management the way
-    # investing.com does -- a plain `requests` call gets a normal 200 here
-    # (verified directly). curl_cffi's impersonate="chrome" is kept anyway
-    # as cheap insurance against that changing later, not because it's
-    # currently required.
-    resp = requests.get(
-        f"{BASE_URL}?{param}", headers=HEADERS, timeout=15, impersonate="chrome"
+    if not FLARESOLVERR_URL:
+        raise RuntimeError(
+            "FLARESOLVERR_URL is not configured -- Forex Factory now requires "
+            "a Cloudflare JS challenge to be solved before it'll serve the "
+            "calendar (confirmed directly, 2026-08), so this service can't "
+            "fetch anything without a FlareSolverr instance to route through. "
+            "See README's Maintenance notes."
+        )
+
+    # Previously a direct `requests.get(url, headers=HEADERS, impersonate="chrome")`
+    # -- Forex Factory didn't sit behind Cloudflare bot management when that
+    # was written, confirmed directly at the time. It does now (also
+    # confirmed directly: a plain request gets served
+    # challenges.cloudflare.com's interstitial instead of the calendar, even
+    # with curl_cffi's TLS fingerprint spoofing) -- curl_cffi can't get past
+    # a real JS challenge no matter what it impersonates, since nothing
+    # actually executes the challenge script. FlareSolverr does that part
+    # with a real headless browser and hands back the resulting HTML, so
+    # parse_calendar() below needs no changes at all -- confirmed directly,
+    # the returned HTML contains the exact same calendar__* markup as
+    # before, this only changes how it's fetched.
+    resp = requests.post(
+        f"{FLARESOLVERR_URL}/v1",
+        json={"cmd": "request.get", "url": url, "maxTimeout": 60000},
+        # FlareSolverr's own budget is maxTimeout above (60s) -- this needs
+        # to be a bit longer than that, not equal to it, so a solve that
+        # takes the full internal budget doesn't also get cut off by this
+        # library's own timeout right as FlareSolverr was about to respond.
+        timeout=65,
     )
     resp.raise_for_status()
-    return resp.text
+    data = resp.json()
+
+    if data.get("status") != "ok":
+        raise RuntimeError(f"FlareSolverr couldn't fetch the calendar: {data.get('message')}")
+
+    solution = data.get("solution", {})
+    upstream_status = solution.get("status")
+    if upstream_status and upstream_status != 200:
+        raise RuntimeError(f"FlareSolverr reached Forex Factory, but it returned HTTP {upstream_status}")
+
+    return solution.get("response", "")
 
 
 def parse_value_state(cell) -> str:

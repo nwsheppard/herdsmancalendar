@@ -29,6 +29,35 @@ repo on every run, so there's nothing vendored here to fall out of date.
 - `herdsman-calendar-install.sh` — run inside the LXC by `build.func`;
   installs Python, fetches the app, creates the systemd service, and starts it
 
+## Before you start: FlareSolverr is required
+
+Forex Factory sits behind a Cloudflare JS challenge as of 2026-08 (see
+`calendar_api.py`'s module docstring) -- the API can't fetch the calendar
+at all without a [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr)
+instance to route the request through. It isn't installed by this script
+(it needs a real headless browser, much heavier than this LXC's own 512MB
+default) -- run it separately (its own LXC/container/VM, wherever's
+convenient, as long as this container can reach it), then either:
+
+- Fresh install: `export FLARESOLVERR_URL=http://<host>:8191` before
+  running the install command below -- picked up automatically *if*
+  community-scripts' `build.func` happens to forward it through to the
+  container-side script (not guaranteed either way; the install finishes
+  successfully regardless, and prints a clear reminder at the end if it
+  didn't take).
+- Any time (fresh install or already installed): set it directly --
+  ```bash
+  pct exec <ctid> -- systemctl edit herdsman-calendar-api
+  # add under [Service]:
+  #   Environment=FLARESOLVERR_URL=http://<your-flaresolverr-host>:8191
+  pct exec <ctid> -- systemctl restart herdsman-calendar-api
+  ```
+
+Without this, every `/calendar` request fails with a clear error naming
+exactly what's missing (`FLARESOLVERR_URL is not configured...`), not a
+confusing timeout -- check `journalctl -u herdsman-calendar-api -f` if
+you're not sure whether it's set.
+
 ## Quick install
 
 Run directly on a Proxmox VE host:
@@ -70,13 +99,19 @@ A well-known scraper for Forex Factory
 ([fizahkhalid/forex_factory_calendar_news_scraper](https://github.com/fizahkhalid/forex_factory_calendar_news_scraper))
 uses Selenium, which would have meant a much heavier LXC container (a real
 or headless Chrome binary + chromedriver, hundreds of MB, much slower per
-request). That turned out to be unnecessary: Forex Factory's calendar event
-data is server-rendered in the initial HTML response, and the site doesn't
-sit behind Cloudflare bot management the way investing.com did -- a plain
-`requests` call gets a normal 200 (verified directly). So this stayed the
-same lightweight `curl_cffi` (kept as cheap insurance rather than because
-it's currently required) `+ BeautifulSoup` service it always was, just
-pointed at a different site.
+request). That turned out to be unnecessary at the time: Forex Factory's
+calendar event data is server-rendered in the initial HTML response, and
+back in 2026-07 the site didn't sit behind Cloudflare bot management the
+way investing.com did -- a plain `requests` call got a normal 200
+(verified directly at the time). **That held only until 2026-08** --
+Forex Factory added a Cloudflare JS challenge, and this service now
+depends on a separately-run FlareSolverr instance to get past it (see
+"Before you start" above) -- the exact heavier-infrastructure outcome this
+section originally said turned out to be unnecessary. `curl_cffi` stays in
+`requirements.txt` for the request *to FlareSolverr itself*, not because
+its TLS fingerprint spoofing still does anything against Forex
+Factory directly -- it doesn't, a real JS challenge doesn't care what a
+request's TLS handshake looks like.
 
 Forex Factory organizes events by **currency** (9 of them: the majors plus
 CNY, plus "All" for events that apply broadly rather than to one currency,
@@ -184,6 +219,16 @@ themselves being blanked.
 
 ## Maintenance notes
 
+- If every `/calendar` request fails outright (not just missing/wrong
+  data, but every request erroring), check FlareSolverr before assuming
+  `calendar_api.py` broke: is it running, is `FLARESOLVERR_URL` set
+  correctly on this service (`systemctl cat herdsman-calendar-api` shows
+  the effective config, including any `systemctl edit` drop-in), and can
+  it still solve Forex Factory's challenge right now -- Cloudflare's own
+  challenge mechanics change too, independent of anything in this repo.
+  `journalctl -u herdsman-calendar-api -f` surfaces the specific error
+  either way -- a missing/wrong `FLARESOLVERR_URL` and a FlareSolverr-side
+  failure log differently (see `calendar_api.py`'s `fetch_calendar_html()`).
 - forexfactory.com can change its HTML structure, so this service may need
   periodic selector updates. If events stop appearing, or impact levels all
   come back the same, the first things to check are `WIDGET_TABLE_CLASS`

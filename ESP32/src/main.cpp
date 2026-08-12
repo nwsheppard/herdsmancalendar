@@ -236,8 +236,16 @@ void apply_pending_wifi_icon_state()
 /**
  * WiFi.onEvent() callback -- runs on the WiFi/event task, so it must not
  * touch LVGL objects directly (see comment on pending_wifi_icon_state).
+ *
+ * Takes the `arduino_event_info_t` overload (previously just the bare
+ * event id) specifically to log the disconnect reason/RSSI -- added after
+ * a real drop-and-never-reconnects report with nothing in the log to
+ * explain why. `WiFi.reconnect()` in loop()'s backstop retries blind
+ * either way, but this at least tells us (auth failure vs. AP unreachable
+ * vs. beacon timeout vs. something else) the next time it happens, rather
+ * than just "still down" with no further information.
  */
-void wifi_on_event(WiFiEvent_t event)
+void wifi_on_event(arduino_event_id_t event, arduino_event_info_t info)
 {
     switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
@@ -247,6 +255,8 @@ void wifi_on_event(WiFiEvent_t event)
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         pending_wifi_icon_state = WifiIconState::DISCONNECTED;
         wifi_icon_state_dirty = true;
+        Serial.printf("WiFi disconnected: reason=%d rssi=%d\n", info.wifi_sta_disconnected.reason,
+                      info.wifi_sta_disconnected.rssi);
         break;
     default:
         break;

@@ -20,10 +20,33 @@ out of sync with each other.
   Dockerfile by name so Docker finds it regardless of context location --
   see its own comment if your Docker version is old enough that this
   doesn't apply).
+- `.env.example` -- template for the one required setting
+  (`FLARESOLVERR_URL`, see below). Copy to `.env` (gitignored) and fill in
+  your own value -- `docker-compose.yml` reads it automatically.
+
+## Before you start: FlareSolverr is required
+
+Forex Factory sits behind a Cloudflare JS challenge as of 2026-08 (see
+`calendar_api.py`'s module docstring) -- this service can't fetch the
+calendar at all without a [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr)
+instance to route the request through. FlareSolverr isn't bundled into
+this image (it needs a real headless browser, a much heavier dependency
+than this service's own footprint) -- run it separately (its own
+container is the usual way; a one-liner is in its own README) somewhere
+reachable from wherever this container ends up, then:
+
+```bash
+cp Docker/.env.example Docker/.env
+# edit Docker/.env, set FLARESOLVERR_URL to your instance's address
+```
+
+Without this, every `/calendar` request fails with a clear error
+naming exactly what's missing (`FLARESOLVERR_URL is not configured...`),
+not a confusing timeout or an unrelated-looking failure.
 
 ## Quick start (docker compose)
 
-From the repo root:
+From the repo root (after the `.env` setup above):
 
 ```bash
 docker compose -f Docker/docker-compose.yml up -d --build
@@ -37,13 +60,15 @@ across rebuilds/recreations. Rebuilding after pulling a newer
 ## Quick start (plain `docker`, no compose)
 
 Also from the repo root -- note the `-f`/context arguments, since the
-Dockerfile isn't in the current directory:
+Dockerfile isn't in the current directory. No `.env` file here (that's a
+compose-specific convenience) -- pass `FLARESOLVERR_URL` directly:
 
 ```bash
 docker build -f Docker/Dockerfile -t herdsman-calendar:latest .
 docker run -d \
   --name herdsman-calendar \
   -p 8080:8080 \
+  -e FLARESOLVERR_URL=http://192.168.1.50:8191 \
   -v herdsman_data:/data \
   --restart unless-stopped \
   herdsman-calendar:latest
@@ -69,6 +94,7 @@ or run directly:
 docker run -d \
   --name herdsman-calendar \
   -p 8080:8080 \
+  -e FLARESOLVERR_URL=http://192.168.1.50:8191 \
   -v herdsman_data:/data \
   --restart unless-stopped \
   <your-dockerhub-username>/herdsman-calendar:latest
@@ -113,3 +139,13 @@ this didn't need to change for the container at all, unlike `filters.json`.
 See [`LXC/README.md`](../LXC/README.md)'s own Maintenance notes section --
 Forex Factory scraper selector drift, past bugs found/fixed, etc. all
 apply identically here, since it's the same `calendar_api.py` either way.
+
+If `/calendar` starts failing outright (not just missing/wrong data, but
+every request erroring), check FlareSolverr itself before assuming
+`calendar_api.py` broke: is it still running, is `FLARESOLVERR_URL` in
+`Docker/.env` still correct, and can it still solve Forex Factory's
+challenge right now (Cloudflare's own challenge mechanics change too,
+independent of anything in this repo). `docker logs -f herdsman-calendar`
+surfaces the specific error either way -- a missing/wrong
+`FLARESOLVERR_URL` and a FlareSolverr-side failure look different in the
+log (see `calendar_api.py`'s `fetch_calendar_html()`).

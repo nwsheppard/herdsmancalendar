@@ -12,9 +12,20 @@
 
 namespace {
 
-// Every few minutes is the brief's own suggested cadence for an economic
-// calendar ("every 5-15 minutes is typical... don't hammer the source").
-constexpr uint32_t poll_interval_ms = 10 * 60 * 1000;
+// Was 10 minutes (the brief's own suggested cadence for an economic
+// calendar -- "every 5-15 minutes is typical... don't hammer the
+// source"), but every refresh rebuilds the whole event list
+// (clear_list_yielding() + populate_events(), see below) and that rebuild
+// is where the frame-shift glitch has actually been observed to trigger
+// (see the README's Milestone 8 writeup) -- 10 minutes meant up to ~144
+// of these a day regardless of whether anything calendar-relevant was
+// happening. alert_manager_tick() (alert_manager.cpp) already refreshes
+// 30-40s after each event's own scheduled time to pick up actual/forecast
+// values as they land, so freshness right around real events doesn't
+// depend on this periodic poll at all -- this one is now just a
+// once-an-hour backstop to catch newly-added/updated events and roll the
+// Day tab to the next day overnight, not a constant drumbeat.
+constexpr uint32_t poll_interval_ms = 60 * 60 * 1000;
 uint32_t last_poll_ms = 0;
 
 lv_obj_t * calendar_screen_ref = nullptr;
@@ -521,6 +532,16 @@ void populate_events(const std::vector<CalendarEvent> & events, bool show_ccy)
     // depending on the currency filter, not just change size.
     const ColumnLayout layout = compute_column_layout(events, show_ccy);
     rebuild_header_row(calendar_screen_ref, layout);
+    // rebuild_header_row() deletes the old header and creates up to 7 new
+    // objects (the header container + TIME/CCY/EVENT/ACT/FCST/PREV labels)
+    // with no yield of its own -- without this call, that whole backlog
+    // silently bundles into whichever lv_timer_handler() call happens
+    // next (the first row below), inflating just that one call. Confirmed
+    // directly on hardware: the first "populate_events row" [stall] after
+    // this was added logged noticeably higher (114ms) than every
+    // subsequent one (68ms) on the same refresh -- this is what actually
+    // fixes that, not a fixed threshold or a bigger buffer.
+    timed_timer_handler("populate_events header rebuild");
 
     if (events.empty()) {
         lv_label_set_text(status_label, "No events match your current filters for this range.");

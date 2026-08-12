@@ -11,6 +11,16 @@ services:
     container_name: herdsman-calendar
     ports:
       - "8080:8080"
+    environment:
+      # Required -- Forex Factory now sits behind a Cloudflare JS challenge
+      # (see calendar_api.py's module docstring), so this needs a
+      # FlareSolverr instance's address to fetch anything at all. No
+      # sensible default -- specific to whoever's running this. Copy
+      # Docker/.env.example to Docker/.env and fill in your own instance's
+      # address (compose reads .env automatically from this file's own
+      # directory), or export FLARESOLVERR_URL in your shell before running
+      # `docker compose`.
+      - FLARESOLVERR_URL=${FLARESOLVERR_URL:?Set FLARESOLVERR_URL in Docker/.env -- see Docker/README.md}
     volumes:
       # Whole directory, not filters.json itself -- see the Dockerfile's
       # FILTERS_DIR comment for why a single-file mount is the wrong move
