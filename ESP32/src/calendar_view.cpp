@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 #include <vector>
 
 #include "alert_manager.h"
@@ -26,7 +29,24 @@ namespace {
 // once-an-hour backstop to catch newly-added/updated events and roll the
 // Day tab to the next day overnight, not a constant drumbeat.
 constexpr uint32_t poll_interval_ms = 60 * 60 * 1000;
+
+// Used instead of poll_interval_ms right after a failed refresh (server
+// unreachable, WiFi blip, etc.) -- reported directly from hardware that a
+// failure at the top of the hour otherwise left "Could not load events"
+// on screen for a full hour before the next attempt. Retrying sooner
+// means giving up some of the reduced glitch exposure poll_interval_ms
+// above was for, but only while something's actually broken, not as a
+// new steady-state cadence.
+constexpr uint32_t poll_retry_interval_ms = 2 * 60 * 1000;
+
 uint32_t last_poll_ms = 0;
+
+// Sticky until the next refresh actually resolves -- calendar_view_poll()
+// reads this to pick poll_interval_ms vs. poll_retry_interval_ms. Starts
+// true so the very first poll (calendar_view_create()'s own initial
+// refresh_events() call, not calendar_view_poll() at all) doesn't cause an
+// immediate second fetch.
+bool last_refresh_ok = true;
 
 lv_obj_t * calendar_screen_ref = nullptr;
 lv_obj_t * wifi_icon_label = nullptr;
@@ -53,6 +73,58 @@ String current_range = "day";
 // restore a row that's no longer the countdown target (the row itself only
 // carries its event id, via lv_obj_user_data, not its original time text).
 std::vector<CalendarEvent> current_events;
+
+// Forex Factory now sits behind FlareSolverr (see calendar_api.py), which
+// takes several seconds per fetch -- up to ~30s the first time a session
+// needs its timezone fixed -- instead of the well-under-a-second responses
+// this used to get back when calendar_api.py scraped forexfactory.com
+// directly. refresh_events() used to call calendar_client_get_filters()/
+// calendar_client_get_calendar() straight from loop()'s own task, which
+// also runs lv_timer_handler() -- confirmed directly on hardware that this
+// now freezes the whole screen (no redraws, no clock, no alerts) for
+// however long the fetch takes. The fetch itself is moved onto a separate
+// FreeRTOS task below (refresh_task()) so loop()/lv_timer_handler() keep
+// running while it's in flight; the result comes back over
+// refresh_result_queue and gets applied to the UI from apply_ready_refresh_result(),
+// which runs on the main/LVGL task like every other UI mutation in this file
+// (LVGL itself isn't thread-safe, so the fetch task only ever touches plain
+// data, never an lv_obj_t).
+QueueHandle_t refresh_result_queue = nullptr;
+bool refresh_in_flight = false;
+// Set when refresh_events() is called again while a fetch is already in
+// flight (e.g. a tab switch during the periodic poll, or vice versa) --
+// rather than stacking a second concurrent HTTPClient/task on top of the
+// first, this just remembers to kick a fresh fetch once the current one
+// lands.
+bool pending_refresh_requested = false;
+
+struct RefreshResult {
+    // The range this result was actually fetched for -- current_range may
+    // have changed (a tab switch) while the fetch was still in flight, in
+    // which case this result is stale and should be discarded rather than
+    // applied to the now-wrong tab.
+    String range;
+    bool success = false;
+    bool show_ccy = true;
+    std::vector<CalendarEvent> events;
+};
+
+void refresh_task(void * param)
+{
+    RefreshResult * result = new RefreshResult();
+    result->range = *static_cast<String *>(param);
+    delete static_cast<String *>(param);
+
+    // Same two calls refresh_events() used to make directly -- just now off
+    // the LVGL task. Neither touches any lv_obj_t, only calendar_client.cpp's
+    // own HTTPClient/ArduinoJson state and this function's local variables.
+    CalendarFilters filters;
+    result->show_ccy = !(calendar_client_get_filters(filters) && filters.currency_codes.size() == 1);
+    result->success = calendar_client_get_calendar(result->range, result->events);
+
+    xQueueSend(refresh_result_queue, &result, portMAX_DELAY);
+    vTaskDelete(nullptr);
+}
 
 // One entry per row currently highlighted as an active countdown --
 // several at once whenever multiple events share (or nearly share) a
@@ -582,41 +654,114 @@ void populate_events(const std::vector<CalendarEvent> & events, bool show_ccy)
 
 void refresh_events()
 {
+    if (refresh_result_queue == nullptr) {
+        // Lazily created rather than at startup: this file has no single
+        // init function that always runs before the first refresh_events()
+        // call (calendar_view_create() bails out early via
+        // make_no_server_message() when no server's configured yet), so
+        // "first time refresh_events() actually runs" is the one point
+        // that's guaranteed to precede every use of this queue.
+        refresh_result_queue = xQueueCreate(1, sizeof(RefreshResult *));
+    }
+
+    if (refresh_in_flight) {
+        pending_refresh_requested = true;
+        return;
+    }
+
     lv_label_set_text(status_label, "Loading events...");
     timed_timer_handler("refresh_events loading label");
 
-    // CCY column dropped entirely when exactly one currency is selected --
-    // reported directly as wanted ("most people using this are going to
-    // use it for USD"), since a column repeating the same 3-letter code on
-    // every single row is pure waste of EVENT's space. Defaults to shown
-    // (the safe/current behavior) if the filter fetch itself fails, same
-    // fallback direction as everything else here on a network hiccup.
-    CalendarFilters filters;
-    const bool show_ccy = !(calendar_client_get_filters(filters) && filters.currency_codes.size() == 1);
+    refresh_in_flight = true;
+    String * range_param = new String(current_range);
+    // Stack size matches this project's other network+JSON work (plain
+    // HTTPClient GETs + ArduinoJson's heap-backed JsonDocument, no TLS) --
+    // no deep recursion or large local buffers in refresh_task() itself.
+    // Priority 1 matches Arduino's own loopTask, so this fetch doesn't get
+    // starved by anything else the app is doing.
+    //
+    // Originally pinned explicitly to core 0 (loopTask runs on core 1), on
+    // the theory that keeping this off the LVGL task's own core would be
+    // the safest way to guarantee it never blocks lv_timer_handler(). That
+    // backfired on hardware: WiFi/lwIP's own internal tasks also live on
+    // core 0 by default on ESP32 Arduino, and the very first background
+    // fetch after this was flashed failed to even connect (HTTPClient
+    // status -1 on both /filters and /calendar, each after ~5000ms -- a
+    // connect-timeout signature, not a slow response) with no WiFi
+    // disconnect logged around it -- i.e. the radio link was fine, only
+    // this task's own connection attempt wasn't going through. Not pinning
+    // at all (tskNO_AFFINITY) doesn't need core separation from loopTask
+    // to keep the screen responsive anyway: this task spends nearly all
+    // its time blocked in socket recv() waiting on the network, not
+    // burning CPU, so FreeRTOS's own preemption keeps lv_timer_handler()
+    // running regardless of which core either task lands on.
+    xTaskCreatePinnedToCore(refresh_task, "calendar_refresh", 8192, range_param, 1, nullptr, tskNO_AFFINITY);
+}
 
-    std::vector<CalendarEvent> events;
-    if (calendar_client_get_calendar(current_range, events)) {
-        populate_events(events, show_ccy);
-    } else {
-        lv_obj_clean(list);
-        lv_label_set_text(status_label, "Could not load events -- check the connection and try again.");
+/**
+ * Applies whatever refresh_task() last placed on refresh_result_queue, if
+ * anything -- called every loop() iteration (via calendar_view_tick()) so a
+ * fetch that finishes gets picked up promptly without polling on a timer.
+ * Runs on the main/LVGL task, same as every other UI mutation in this file.
+ */
+void apply_ready_refresh_result()
+{
+    if (refresh_result_queue == nullptr) {
+        return;
     }
 
-    // Unconditional, including on failure/empty (an empty vector clears any
-    // previously tracked events) -- alert_manager shouldn't keep counting
-    // down to or refreshing for an event that no longer matches current
-    // filters or came from a now-stale fetch. current_events mirrors this
-    // for the same reason: update_next_event_row() needs it to restore a
-    // row's plain time text, and a stale entry there is just as wrong.
-    current_events = events;
-    alert_manager_set_events(events);
+    RefreshResult * result = nullptr;
+    if (xQueueReceive(refresh_result_queue, &result, 0) != pdTRUE) {
+        return;
+    }
 
-    // The list was just rebuilt from scratch, so even if the same event(s)
-    // are still tracked as active after this refresh, their border
-    // highlights wouldn't survive on the new row objects -- clear the
-    // tracked set so the next tick re-applies highlights fresh instead of
-    // assuming any from before the rebuild are still there.
-    highlighted_rows.clear();
+    refresh_in_flight = false;
+    // Read by calendar_view_poll() to pick poll_interval_ms vs.
+    // poll_retry_interval_ms for the *next* attempt -- set from this
+    // result's own success regardless of whether it's about to be
+    // discarded as stale below, since it still reflects whether the fetch
+    // itself actually reached the server just now.
+    last_refresh_ok = result->success;
+
+    // current_range may have changed (a tab switch) while this fetch was in
+    // flight -- applying a result fetched for the tab the user has since
+    // navigated away from would flash the wrong data for a moment. Discard
+    // it instead and let the fresh-fetch-on-completion path below (which
+    // pending_refresh_requested's own setter already triggered) replace it.
+    if (result->range == current_range) {
+        if (result->success) {
+            populate_events(result->events, result->show_ccy);
+        } else {
+            lv_obj_clean(list);
+            lv_label_set_text(status_label, "Could not load events -- check the connection and try again.");
+        }
+
+        // Unconditional, including on failure/empty (an empty vector clears
+        // any previously tracked events) -- alert_manager shouldn't keep
+        // counting down to or refreshing for an event that no longer
+        // matches current filters or came from a now-stale fetch.
+        // current_events mirrors this for the same reason:
+        // update_next_event_row() needs it to restore a row's plain time
+        // text, and a stale entry there is just as wrong.
+        current_events = result->events;
+        alert_manager_set_events(result->events);
+
+        // The list was just rebuilt from scratch, so even if the same
+        // event(s) are still tracked as active after this refresh, their
+        // border highlights wouldn't survive on the new row objects --
+        // clear the tracked set so the next tick re-applies highlights
+        // fresh instead of assuming any from before the rebuild are still
+        // there.
+        highlighted_rows.clear();
+    }
+
+    const bool was_stale = result->range != current_range;
+    delete result;
+
+    if (was_stale || pending_refresh_requested) {
+        pending_refresh_requested = false;
+        refresh_events();
+    }
 }
 
 /** Finds the event row tagged with `id` (see make_event_row()), or nullptr. */
@@ -833,6 +978,7 @@ void calendar_view_tick()
     if (list == nullptr) {
         return; // no server configured yet, or "no server" message still showing
     }
+    apply_ready_refresh_result();
     update_next_event_row();
 }
 
@@ -850,7 +996,8 @@ void calendar_view_poll()
     // iteration once past the first interval, forever, instead of once per
     // interval like everything else.
     const uint32_t now = millis();
-    if (now - last_poll_ms >= poll_interval_ms) {
+    const uint32_t interval = last_refresh_ok ? poll_interval_ms : poll_retry_interval_ms;
+    if (now - last_poll_ms >= interval) {
         last_poll_ms = now;
         calendar_view_refresh();
     }

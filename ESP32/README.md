@@ -1702,6 +1702,33 @@ DMA-desync recovery path -- below the ceiling of what this project's
 instrumentation, or the currently-reachable ESP-IDF driver surface, can
 observe or influence.
 
+**2026-08: new data point on what triggers the recovery path, from the
+FlareSolverr-related fetch work above.** Reported directly: the glitch
+landed exactly during a `/calendar` fetch that was failing with a
+read-timeout (the `setTimeout()` `uint16_t` overflow above) -- 4.5s of the
+WiFi radio actively waiting on a stalled connection. WiFi radio activity
+is the standard ESP32 suspect for the kind of interrupt-latency spike that
+would make `lcd_rgb_panel_try_restart_transmission()`'s recovery visible
+(per its own comment, quoted above: "if this interrupt is late enough, the
+display will shift"), and this is the first time this project has had a
+concrete WiFi-activity window to correlate a real occurrence against,
+rather than routine background noise. Not a fix -- the recovery path
+itself is still confirmed unreachable from application code (see above) --
+but it sharpens *why* FlareSolverr made this worse independent of fetch
+duration alone: every `/calendar` fetch now keeps the radio meaningfully
+busy for several seconds (previously well under one), so each refresh has
+a bigger window for this to land in, on top of just taking longer overall.
+The `poll_interval_ms` throttle (Milestone 8, above) already mitigates via
+frequency; there's no equivalent lever for shortening a single fetch's own
+radio-active window, since that's dictated by FlareSolverr's own solve
+time, not anything this firmware controls.
+
+**Not yet confirmed** whether the glitch also shows up on an ordinary
+*successful* `/calendar` fetch (radio busy for several seconds, but no
+failure/retry behavior) now that the read-timeout bug itself is fixed --
+that's the next useful data point, since this occurrence coincided with a
+failing/retrying request specifically, not a clean one.
+
 **Mitigation instead of a fix: reported directly that the glitch shows up
 shortly after a refresh specifically, and that constant refreshing isn't
 actually needed -- only around the times events are scheduled.** Can't
@@ -1723,6 +1750,87 @@ Compiles clean. **Not yet confirmed on hardware whether this
 meaningfully reduces how often the glitch is seen** -- it's a reduction
 in exposure to the trigger, not a fix for the trigger itself, so it's
 expected to make the glitch rarer, not eliminate it.
+
+## 2026-08: calendar fetch moved off the LVGL task
+
+Forex Factory's Cloudflare JS challenge (see `LXC/calendar_api.py`'s
+docstring) means `calendar_api.py` now routes `/calendar` through
+FlareSolverr instead of scraping directly -- a real fetch now takes
+several seconds, and up to ~30s the first time a session needs its
+timezone auto-fixed, instead of the well-under-a-second responses this
+used to get. `refresh_events()` (`calendar_view.cpp`) called
+`calendar_client_get_filters()`/`calendar_client_get_calendar()` straight
+from `loop()`'s own task -- the same task that runs `lv_timer_handler()` --
+with no yield inside either blocking HTTP call. Reported directly: the
+screen now visibly freezes (no redraws, no clock, no alert countdowns) for
+however long a refresh takes, which went from unnoticeable to several
+seconds (worst case ~30s) purely because of the backend change above, not
+anything in the firmware itself.
+
+Fixed by moving the fetch onto its own FreeRTOS task (`refresh_task()`,
+pinned to core 0, opposite `loopTask`'s core 1) so `loop()`/
+`lv_timer_handler()` keep running while it's in flight. The result comes
+back over a single-slot queue (`refresh_result_queue`) and gets applied to
+the UI from `apply_ready_refresh_result()`, called every `loop()` iteration
+via `calendar_view_tick()` -- that function is the only thing that ever
+touches an `lv_obj_t` from this flow, keeping LVGL access on the one task
+it's actually safe on. A tab switch (or the periodic poll) that lands while
+a fetch is already in flight no longer stacks a second concurrent
+HTTPClient/task on top of it -- it just sets a flag
+(`pending_refresh_requested`) to kick a fresh fetch once the current one
+lands; a result whose range no longer matches the current tab (the user
+switched away mid-fetch) is discarded rather than flashing stale data for
+the wrong tab. Compiles clean (RAM 35.3%, Flash 70.6% -- unchanged from
+before this).
+
+**Follow-up, confirmed on hardware:** `refresh_task()` was initially
+pinned explicitly to core 0 (`loopTask` runs on core 1), on the theory
+that keeping it off the LVGL task's own core was the safest way to
+guarantee it could never block `lv_timer_handler()`. That backfired --
+the very first background fetch after flashing failed to even connect
+(`GET .../filters failed, status/error: -1` and same for `/calendar`,
+each after ~5000ms -- a connect-timeout signature, not a slow response),
+with no WiFi disconnect logged around it, meaning the radio link itself
+was fine. ESP32 Arduino's own WiFi/lwIP internal tasks also default to
+core 0, and pinning our fetch task there put it in contention with them.
+Changed to `tskNO_AFFINITY` (let the scheduler place it) -- doesn't need
+core separation from `loopTask` to keep the screen responsive anyway,
+since this task spends nearly all its time blocked in socket `recv()`,
+not burning CPU, so preemption keeps `lv_timer_handler()` running
+regardless of which core either task lands on. Compiles clean, same
+RAM/Flash.
+
+**Confirmed on hardware:** the `tskNO_AFFINITY` change fixed the connect
+failure -- the next boot connected to the calendar API fine. But it
+surfaced a second, distinct problem in the same log: `GET .../calendar
+failed, status/error: -11` after exactly 8042ms -- HTTPClient's
+read-timeout code, hit right at `calendar_client.cpp`'s hardcoded 8s
+timeout (`http_get()`). That 8s budget was sized for calendar_api.py's own
+local work (filters/health/etc, no upstream dependency) -- `/calendar`
+specifically routes through FlareSolverr server-side and calendar_api.py
+budgets up to 65s for that (two round trips back-to-back the first time a
+session needs its timezone auto-fixed), so 8s was cutting off a fetch that
+was still legitimately in progress, not actually stuck. `http_get()` now
+takes an optional per-call timeout (default unchanged at 8s);
+`calendar_client_get_calendar()` passes 70s. Safe to do now specifically
+*because* the fetch runs on its own background task (previous entry) --
+before that change, an 70s timeout on the LVGL task would have meant a
+70s frozen screen instead of an 8s one. Compiles clean, same RAM/Flash.
+
+**Follow-up, confirmed on hardware:** the 70s timeout didn't take --
+`/calendar` failed again, this time after only ~4.5s (still status -11,
+read-timeout). Root cause: `HTTPClient::setTimeout()` takes a `uint16_t`,
+which tops out at 65535 -- passing 70000 silently wrapped to
+`70000 % 65536 = 4464`, and `http_get()`'s own parameter was a `uint32_t`,
+so nothing caught the overflow before it reached `setTimeout()`. Fixed
+two ways: the actual value passed for `/calendar` is now 65000 (the
+largest round number that fits, comfortably above the ~30s worst case
+confirmed during `calendar_api.py`'s timezone self-heal testing), and
+`http_get()`'s parameter type is now `uint16_t` too, so a future caller
+passing an out-of-range value gets a compiler warning at the call site
+instead of a silent runtime wraparound. Compiles clean, same RAM/Flash.
+**Not yet confirmed on hardware** whether a real `/calendar` fetch now
+completes successfully within the corrected budget.
 
 ## Roadmap (from the brief, plus Milestones 4 and 6 which weren't in it)
 

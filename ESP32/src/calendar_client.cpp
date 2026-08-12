@@ -7,19 +7,31 @@ namespace {
 
 String base_url;
 
+// Default for every endpoint except /calendar (see calendar_client_get_calendar()'s
+// own timeout below) -- these all run entirely on calendar_api.py's own LXC,
+// no upstream round-trip involved, so 8s is already generous.
+//
+// uint16_t, not a rounder uint32_t: matches HTTPClient::setTimeout()'s own
+// parameter type below (tops out at 65535ms) -- confirmed directly on
+// hardware that a wider type here just moves the overflow trap to whoever
+// calls http_get() with something >65535 instead of catching it at the
+// call site, which is exactly what happened once already (see
+// calendar_client_get_calendar()'s own comment).
+constexpr uint16_t default_timeout_ms = 8000;
+
 /**
  * GET helper: returns the response body, or empty string logged to Serial
  * on failure. Every call logs its own elapsed time -- this is the one
- * place all GET requests (health/filters/currencies/columns) go through,
- * so it's the cheapest place to see exactly where time goes on a "why is
- * this screen slow" report, rather than guessing (e.g. currencies/columns
- * are cached in RAM after their first fetch each power-on -- a repeat
- * "GET .../currencies" line here would mean that cache isn't working;
- * its absence means something else is the actual cost, most likely the
- * unavoidable per-open /filters round-trip or plain WiFi/HTTPClient
- * latency, not re-fetching data that's already static).
+ * place all GET requests (health/filters/currencies/columns/calendar) go
+ * through, so it's the cheapest place to see exactly where time goes on a
+ * "why is this screen slow" report, rather than guessing (e.g. currencies/
+ * columns are cached in RAM after their first fetch each power-on -- a
+ * repeat "GET .../currencies" line here would mean that cache isn't
+ * working; its absence means something else is the actual cost, most
+ * likely the unavoidable per-open /filters round-trip or plain WiFi/
+ * HTTPClient latency, not re-fetching data that's already static).
  */
-String http_get(const String & path)
+String http_get(const String & path, uint16_t timeout_ms = default_timeout_ms)
 {
     if (base_url.length() == 0) {
         Serial.println("Calendar server not configured (Settings) -- skipping request");
@@ -29,7 +41,7 @@ String http_get(const String & path)
     HTTPClient http;
     const String url = base_url + path;
     http.begin(url);
-    http.setTimeout(8000);
+    http.setTimeout(timeout_ms);
 
     const uint32_t start_ms = millis();
     const int status = http.GET();
@@ -142,7 +154,29 @@ bool calendar_client_get_columns(std::vector<StringOption> & out)
 
 bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out)
 {
-    const String body = http_get("/calendar?range=" + range);
+    // /calendar routes through FlareSolverr server-side (see
+    // calendar_api.py's fetch_calendar_html()) to solve Forex Factory's
+    // Cloudflare challenge -- calendar_api.py itself budgets up to 65s for
+    // that round trip (two of them, back-to-back, the first time a session
+    // needs its timezone auto-fixed). default_timeout_ms (8s) was sized for
+    // every other endpoint, all of which are calendar_api.py's own local
+    // work with no upstream dependency -- confirmed directly on hardware
+    // that using it here cut a real fetch off at 8042ms with a read-timeout
+    // (status -11), not because anything was actually wrong. This runs on
+    // its own background task (calendar_view.cpp's refresh_task()), not the
+    // LVGL task, so a long timeout here no longer risks freezing the screen
+    // the way it would have before that change.
+    //
+    // 65000, not 70000: HTTPClient::setTimeout() takes a uint16_t, which
+    // tops out at 65535 -- confirmed directly on hardware that passing
+    // 70000 silently wrapped to 70000 % 65536 = 4464 (this file's own
+    // http_get() takes a uint32_t, which hid the overflow until it reached
+    // setTimeout() itself), and the very next fetch failed with a
+    // read-timeout at ~4.5s, not the intended 70s. 65000 is the largest
+    // round value that actually fits, comfortably above the ~30s worst
+    // case confirmed directly during calendar_api.py's own timezone
+    // self-heal testing.
+    const String body = http_get("/calendar?range=" + range, 65000);
     if (body.length() == 0) {
         return false;
     }
