@@ -45,7 +45,10 @@ convenient, as long as this container can reach it), then either:
   container-side script (not guaranteed either way; the install finishes
   successfully regardless, and prints a clear reminder at the end if it
   didn't take).
-- Any time (fresh install or already installed): set it directly --
+- Already installed: `pct enter <ctid>`, then
+  `FLARESOLVERR_URL=http://<host>:8191 update` -- see "Updating" below.
+  Same result as a manual `systemctl edit`, no separate step needed.
+- Or set it directly, any time (fresh install or already installed):
   ```bash
   pct exec <ctid> -- systemctl edit herdsman-calendar-api
   # add under [Service]:
@@ -78,6 +81,23 @@ Proxmox Helper Scripts update in-container, not by re-running the host
 script: `pct enter <ctid>`, then run `update`. That re-invokes `install.sh`'s
 `update_script()` function, which pulls the latest `calendar_api.py` /
 `requirements.txt`, reinstalls dependencies, and restarts the service.
+
+`update` also doubles as a way to set (or change) `FLARESOLVERR_URL`
+without a separate `systemctl edit` step -- export it first:
+
+```bash
+FLARESOLVERR_URL=http://<your-flaresolverr-host>:8191 update
+```
+
+Safe to run this way every time regardless of whether it's already set --
+it writes to the same drop-in file `systemctl edit` itself would use
+(`override.conf`), so there's never two separate overrides fighting over
+the same setting, and re-writing the same value is a no-op. Leaving
+`FLARESOLVERR_URL` unset and just running plain `update` leaves whatever's
+already configured untouched (doesn't reset it to empty) -- `update`
+prints a clear reminder at the end only if it finds the service's
+*effective* environment still has nothing configured, checked after the
+restart, not just whether this particular run happened to set it.
 
 ## Testing the API
 
@@ -141,6 +161,17 @@ the first `/calendar` or `/filters` request, which is surprising to find
 missing if you go looking for it right after `systemctl start`/`update`.
 This file survives `update` redeploys, since those only overwrite
 `calendar_api.py`/`requirements.txt`.
+
+A second file, `ff_session.json`, lives next to it for the same reason --
+Forex Factory geolocates an anonymous visitor's timezone from their IP by
+default (confirmed directly, 2026-08: this project's own outbound IP got
+America/Sao_Paulo, not America/New_York -- exactly a "+1 hour off" during
+EDT), so `fetch_calendar_html()` self-heals it by driving Forex Factory's
+`/timezone` form once and persisting the resulting session cookies here.
+Nothing to configure -- it's created automatically on the first `/calendar`
+fetch and reused after that, so only the first fetch after a fresh install
+(or after deleting this file) takes noticeably longer (~30s vs ~6s) while
+it fixes the timezone once.
 
 `columns` (which optional per-event fields -- Impact/Actual/Forecast/
 Previous -- to display) works differently here than it did against
@@ -229,6 +260,12 @@ themselves being blanked.
   `journalctl -u herdsman-calendar-api -f` surfaces the specific error
   either way -- a missing/wrong `FLARESOLVERR_URL` and a FlareSolverr-side
   failure log differently (see `calendar_api.py`'s `fetch_calendar_html()`).
+- If event times look off by a fixed offset (commonly "+1 hour" during
+  EDT), that's Forex Factory's IP-geolocated timezone default, not a bug in
+  this scraper -- `fetch_calendar_html()` should self-heal it automatically
+  via `/opt/herdsman-calendar/ff_session.json`. If it's stuck, delete that
+  file (`rm /opt/herdsman-calendar/ff_session.json`) to force a fresh fix on
+  the next `/calendar` request.
 - forexfactory.com can change its HTML structure, so this service may need
   periodic selector updates. If events stop appearing, or impact levels all
   come back the same, the first things to check are `WIDGET_TABLE_CLASS`

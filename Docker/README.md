@@ -15,7 +15,9 @@ out of sync with each other.
   not this folder (see its own header comment for why) -- every command
   below accounts for that.
 - `docker-compose.yml` -- the easiest way to build + run it, including a
-  named volume for persisting `filters.json`.
+  named volume for persisting `filters.json` and `ff_session.json` (the
+  persisted Forex Factory session cookies that pin the calendar's timezone
+  -- see `calendar_api.py`'s module docstring).
 - `Dockerfile.dockerignore` -- trims the build context (colocated with the
   Dockerfile by name so Docker finds it regardless of context location --
   see its own comment if your Docker version is old enough that this
@@ -149,3 +151,11 @@ independent of anything in this repo). `docker logs -f herdsman-calendar`
 surfaces the specific error either way -- a missing/wrong
 `FLARESOLVERR_URL` and a FlareSolverr-side failure look different in the
 log (see `calendar_api.py`'s `fetch_calendar_html()`).
+
+If event times look off by a fixed offset instead (commonly "+1 hour"
+during EDT), that's Forex Factory's IP-geolocated timezone default, not a
+bug in this scraper -- `fetch_calendar_html()` self-heals it automatically
+via `ff_session.json` in the `herdsman_data` volume. If it's stuck, remove
+just that file from the volume (or `docker volume rm herdsman_data` to
+reset everything, including `filters.json`) to force a fresh fix on the
+next `/calendar` request.

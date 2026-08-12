@@ -29,6 +29,23 @@ browser -- confirmed directly that the HTML it returns has the exact same
 calendar__* markup as before, so parse_calendar() below needed zero
 changes, only how the HTML gets fetched in the first place.
 
+Also discovered at the same time (2026-08): Forex Factory geolocates an
+anonymous visitor's timezone from their IP by default, not a fixed zone --
+confirmed directly, this LXC's outbound IP got America/Sao_Paulo, which is
+exactly what a user's "+1 hour off during EDT" report turned out to be
+(Sao Paulo sits one hour ahead of New York during EDT). There's no
+query-param/header override for this, only a CSRF-protected form at
+/timezone -- fetch_calendar_html() now checks the fetched page's declared
+timezone and, if it isn't America/New_York, drives that form once via
+FlareSolverr and retries. The resulting session cookies (which pin the
+timezone choice, plus Cloudflare's own cf_clearance) are persisted to
+SESSION_PATH (ff_session.json, next to filters.json -- same FILTERS_DIR
+volume-mount story) so this fix-and-retry round trip only happens
+occasionally, not on every single fetch -- confirmed directly: a fresh
+session takes one extra FlareSolverr round trip (~30s) to self-heal, a
+session that already has the right cookies takes one normal round trip
+(~6s), same as before this was added.
+
 This was a full replacement, not an added option: Forex Factory has no
 equivalent to investing.com's "category" concept (Employment/Inflation/
 Central Banks/...), so that filter dimension is gone, not translated.
@@ -57,7 +74,10 @@ the calendar URL and compare. If instead every request fails outright
 check FlareSolverr itself first (is it running, is FLARESOLVERR_URL
 correct, can it still solve the challenge right now -- Cloudflare's own
 challenge mechanics can change too) before assuming this file's selectors
-are the problem.
+are the problem. If event times look off by a fixed offset instead
+(commonly reported as "+1 hour"), that's the timezone self-heal in
+fetch_calendar_html() -- check ff_session.json isn't stuck on a stale
+fftimezone, or delete it to force a fresh /timezone fix on the next fetch.
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -93,6 +113,7 @@ app = FastAPI(title="Herdsman Trading Terminal Calendar API", lifespan=lifespan)
 # --- Configuration -----------------------------------------------------
 
 BASE_URL = "https://www.forexfactory.com/calendar"
+BASE_URL_ROOT = "https://www.forexfactory.com"
 
 # Required -- Forex Factory now sits behind a Cloudflare JS challenge
 # (confirmed directly, 2026-08: a plain request, even with curl_cffi's TLS
@@ -120,6 +141,11 @@ FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "").rstrip("/")
 # this container tries to save filters with nothing pre-created there yet.
 FILTERS_DIR = Path(os.environ.get("FILTERS_DIR", str(Path(__file__).parent)))
 FILTERS_PATH = FILTERS_DIR / "filters.json"
+
+# Persisted Forex Factory session cookies (fftimezone, cf_clearance, etc) --
+# reuses FILTERS_DIR so it survives container recreations the same way
+# filters.json does, via the same volume mount. See _set_forex_factory_timezone().
+SESSION_PATH = FILTERS_DIR / "ff_session.json"
 DEFAULT_FILTERS = {
     "importance": [2, 3],
     "currencies": ["USD"],
@@ -239,6 +265,87 @@ IMPACT_LABELS = {0: "holiday", 1: "low", 2: "medium", 3: "high"}
 IMPACT_ICON_SUFFIX_LEVELS = {"gra": 0, "yel": 1, "ora": 2, "red": 3}
 
 
+def _load_session_cookies() -> list:
+    if not SESSION_PATH.exists():
+        return []
+    try:
+        with SESSION_PATH.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        log.warning("%s is unreadable -- starting a fresh session", SESSION_PATH)
+        return []
+
+
+def _save_session_cookies(cookies: list) -> None:
+    with SESSION_PATH.open("w", encoding="utf-8") as f:
+        json.dump(cookies, f)
+
+
+def _merge_cookies(base: list, new: list) -> list:
+    # Last-occurrence-wins by cookie name, same de-duplication used when this
+    # was worked out manually against the live site -- `new` (the response
+    # from whatever request just ran) takes priority over `base` (whatever
+    # was loaded/carried in), since it reflects the most current state
+    # (e.g. a fresh cf_clearance replacing an expired one).
+    merged = {c["name"]: c for c in base}
+    merged.update({c["name"]: c for c in new})
+    return list(merged.values())
+
+
+def _flaresolverr_request(cmd: str, url: str, cookies: list | None = None, post_data: str | None = None) -> dict:
+    payload = {"cmd": cmd, "url": url, "maxTimeout": 60000}
+    if cookies:
+        payload["cookies"] = cookies
+    if post_data is not None:
+        payload["postData"] = post_data
+
+    resp = requests.post(
+        f"{FLARESOLVERR_URL}/v1",
+        json=payload,
+        # FlareSolverr's own budget is maxTimeout above (60s) -- this needs
+        # to be a bit longer than that, not equal to it, so a solve that
+        # takes the full internal budget doesn't also get cut off by this
+        # library's own timeout right as FlareSolverr was about to respond.
+        timeout=65,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("status") != "ok":
+        raise RuntimeError(f"FlareSolverr couldn't fetch {url}: {data.get('message')}")
+
+    solution = data.get("solution", {})
+    upstream_status = solution.get("status")
+    if upstream_status and upstream_status != 200:
+        raise RuntimeError(f"FlareSolverr reached {url}, but it returned HTTP {upstream_status}")
+
+    return solution
+
+
+def _set_forex_factory_timezone(cookies: list) -> list:
+    # Forex Factory defaults anonymous visitors to an IP-geolocated
+    # timezone (confirmed directly -- this LXC's outbound IP got
+    # America/Sao_Paulo, not America/New_York, exactly explaining a
+    # reported "+1 hour" offset during EDT). There's no query-param or
+    # header override -- the only way to change it is this CSRF-protected
+    # form, confirmed directly by working through the live flow by hand:
+    # GET /timezone for a fresh CSRF token, then POST it back with the
+    # desired zone.
+    tz_page = _flaresolverr_request("request.get", f"{BASE_URL_ROOT}/timezone", cookies=cookies)
+    csrf_match = re.search(r'name="_csrf" value="([a-f0-9]+)"', tz_page.get("response", ""))
+    if not csrf_match:
+        raise RuntimeError("Couldn't find Forex Factory's _csrf token on /timezone -- page layout may have changed")
+
+    cookies_after_get = _merge_cookies(cookies, tz_page.get("cookies", []))
+    post_solution = _flaresolverr_request(
+        "request.post",
+        f"{BASE_URL_ROOT}/timezone",
+        cookies=cookies_after_get,
+        post_data=f"_csrf={csrf_match.group(1)}&timezone=America%2FNew_York",
+    )
+    return _merge_cookies(cookies_after_get, post_solution.get("cookies", []))
+
+
 def fetch_calendar_html(cal_type: str) -> str:
     # Forex Factory accepts literal "today"/"this" aliases directly (verified
     # directly) -- no need to compute or pass an actual date string.
@@ -266,27 +373,34 @@ def fetch_calendar_html(cal_type: str) -> str:
     # parse_calendar() below needs no changes at all -- confirmed directly,
     # the returned HTML contains the exact same calendar__* markup as
     # before, this only changes how it's fetched.
-    resp = requests.post(
-        f"{FLARESOLVERR_URL}/v1",
-        json={"cmd": "request.get", "url": url, "maxTimeout": 60000},
-        # FlareSolverr's own budget is maxTimeout above (60s) -- this needs
-        # to be a bit longer than that, not equal to it, so a solve that
-        # takes the full internal budget doesn't also get cut off by this
-        # library's own timeout right as FlareSolverr was about to respond.
-        timeout=65,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    cookies = _load_session_cookies()
+    solution = _flaresolverr_request("request.get", url, cookies=cookies)
+    html = solution.get("response", "")
+    cookies = _merge_cookies(cookies, solution.get("cookies", []))
 
-    if data.get("status") != "ok":
-        raise RuntimeError(f"FlareSolverr couldn't fetch the calendar: {data.get('message')}")
+    # Anonymous visitors get an IP-geolocated timezone by default (see
+    # _set_forex_factory_timezone()) -- self-heal it once here rather than
+    # requiring a one-off manual fix, and persist the resulting cookies so
+    # this only runs again if the session's timezone ever reverts (a fresh
+    # cf_clearance without fftimezone, an expired session, etc), not on
+    # every single fetch.
+    tz_match = re.search(r"timezone_name[\"']?\s*[:=]\s*[\"']([^\"']+)", html)
+    if not tz_match or tz_match.group(1) != "America/New_York":
+        log.info("Forex Factory session timezone is %s, not America/New_York -- fixing it", tz_match.group(1) if tz_match else "unknown")
+        cookies = _set_forex_factory_timezone(cookies)
+        solution = _flaresolverr_request("request.get", url, cookies=cookies)
+        html = solution.get("response", "")
+        cookies = _merge_cookies(cookies, solution.get("cookies", []))
 
-    solution = data.get("solution", {})
-    upstream_status = solution.get("status")
-    if upstream_status and upstream_status != 200:
-        raise RuntimeError(f"FlareSolverr reached Forex Factory, but it returned HTTP {upstream_status}")
+        tz_match = re.search(r"timezone_name[\"']?\s*[:=]\s*[\"']([^\"']+)", html)
+        if not tz_match or tz_match.group(1) != "America/New_York":
+            raise RuntimeError(
+                f"Set Forex Factory's timezone to America/New_York but the calendar still shows "
+                f"{tz_match.group(1) if tz_match else 'no timezone at all'} -- not retrying again to avoid looping forever"
+            )
 
-    return solution.get("response", "")
+    _save_session_cookies(cookies)
+    return html
 
 
 def parse_value_state(cell) -> str:
