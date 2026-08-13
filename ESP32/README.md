@@ -1723,11 +1723,52 @@ frequency; there's no equivalent lever for shortening a single fetch's own
 radio-active window, since that's dictated by FlareSolverr's own solve
 time, not anything this firmware controls.
 
-**Not yet confirmed** whether the glitch also shows up on an ordinary
-*successful* `/calendar` fetch (radio busy for several seconds, but no
-failure/retry behavior) now that the read-timeout bug itself is fixed --
-that's the next useful data point, since this occurrence coincided with a
-failing/retrying request specifically, not a clean one.
+**Confirmed on hardware:** the glitch recurred on a fetch that succeeded
+and loaded events normally -- not just on the earlier failing/retrying
+one. That rules out "specific to failed/retrying requests" as the
+distinguishing factor: it's the fetch's WiFi-radio-active window itself
+(several seconds either way, success or failure) that correlates with the
+glitch, not anything about the request erroring. Still not an
+application-level fix available -- same conclusion as the rest of this
+section, just now on firmer evidence. The only lever this project has is
+`poll_interval_ms`'s refresh frequency (already throttled to hourly),
+since there's no way to shorten FlareSolverr's own solve time from the
+firmware side.
+
+## 2026-08: persistent /calendar+/filters failures, needing a reboot to clear
+
+With the 65000/8000ms timeouts above in place, reported directly: both
+`/calendar` and `/filters` started failing with read-timeouts (status
+-11) on *every single retry* for 11+ minutes straight (the
+`poll_retry_interval_ms` 2-minute backoff, already in place from an
+earlier session, kept firing correctly the whole time). Two facts ruled
+out the obvious explanations: `journalctl -u herdsman-calendar-api`
+covering that exact window showed **zero record** of any of these
+requests ever arriving at the LXC (the last successful entry from the
+ESP32's IP is well before the failures start, then total silence until
+long after they stop) -- if `calendar_api.py` itself were stuck, uvicorn
+would still eventually log something. And WiFi never reported
+disconnected (`wifi_on_event()`'s reason/rssi logging, added in an
+earlier session, stayed silent) -- confirmed directly, not a radio drop.
+It also **needed a reboot to recover**, not just time -- later retries
+after the failure window didn't start working again on their own.
+
+That combination -- works fine, then every new connection silently fails
+with the request never reaching the server, only a reboot clears it --
+doesn't point at the server or the WiFi radio. It's the classic signature
+of a leaked resource on the ESP32 side itself: most likely lwIP's own
+small, fixed socket table, or heap fragmentation from the repeated
+`HTTPClient`/`String` churn across retries (a new pattern that didn't
+exist before this session's move to a background-task fetch -- see the
+core-pinning and timeout entries above). Added unconditional
+(`Serial.printf`) free-heap/largest-free-block logging right before each
+`refresh_task()` fetch attempt (`calendar_view.cpp`) -- a steady decline
+across retries during the next occurrence would confirm a heap leak; flat
+heap with fetches still failing would point at socket-table exhaustion
+instead (a different fixed resource, not visible from heap alone).
+Compiles clean (RAM 35.3%, Flash 70.6%). **Not yet confirmed on
+hardware** -- this is purely diagnostic, waiting on the next occurrence
+to actually narrow down which resource is leaking.
 
 **Mitigation instead of a fix: reported directly that the glitch shows up
 shortly after a refresh specifically, and that constant refreshing isn't

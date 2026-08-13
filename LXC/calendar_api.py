@@ -92,6 +92,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("calendar_api")
@@ -146,6 +148,30 @@ FILTERS_PATH = FILTERS_DIR / "filters.json"
 # reuses FILTERS_DIR so it survives container recreations the same way
 # filters.json does, via the same volume mount. See _set_forex_factory_timezone().
 SESSION_PATH = FILTERS_DIR / "ff_session.json"
+
+# Every /calendar request used to trigger its own FlareSolverr round trip
+# (a real headless browser solving Forex Factory's Cloudflare challenge --
+# 6s with a warm session, up to 65s if the timezone self-heal kicks in, see
+# fetch_calendar_html()) -- with the ESP32 polling on its own schedule plus
+# retrying on failure, and anyone loading the calendar in a browser on top
+# of that, every one of those was paying that full cost independently, even
+# though the underlying data only actually changes on Forex Factory's own
+# schedule, not every few seconds. Cached per range (day/week fetch
+# different URLs/content) so only the first request after the cache goes
+# stale pays for a real fetch -- everyone else in that window gets it back
+# immediately. Keyed in-process (not persisted) -- a restart just means the
+# next request repays the fetch once, same as before this existed.
+CALENDAR_CACHE_TTL_S = 5 * 60
+_calendar_cache: dict[str, dict] = {}
+# Held for the *entire* refetch, not just the cache read/write -- without
+# this, several requests arriving while the cache is stale would each kick
+# off their own concurrent FlareSolverr round trip (the exact pile-up
+# reported from hardware: a slow /calendar fetch left the whole process too
+# busy to even answer /filters). With it, the first one in refetches while
+# everyone else waits on the lock and then reads the now-fresh cache
+# instead of triggering their own fetch.
+_calendar_cache_lock = threading.Lock()
+
 DEFAULT_FILTERS = {
     "importance": [2, 3],
     "currencies": ["USD"],
@@ -584,6 +610,45 @@ def apply_column_filter(events: list[dict], columns: list[str]) -> list[dict]:
     return events
 
 
+def get_cached_events(range: str) -> list[dict]:
+    """
+    Cached, unfiltered events for `range` -- fetches fresh only when the
+    cache is missing or older than CALENDAR_CACHE_TTL_S, otherwise returns
+    the cached copy immediately. Filters are intentionally not baked into
+    the cache (see get_calendar()) -- they're cheap to apply per-request,
+    and caching post-filter would mean a filter change doesn't take effect
+    until the cache happens to expire.
+    """
+    with _calendar_cache_lock:
+        cached = _calendar_cache.get(range)
+        if cached is not None and time.monotonic() - cached["fetched_at"] < CALENDAR_CACHE_TTL_S:
+            return cached["events"]
+
+        try:
+            html = fetch_calendar_html(range)
+            events = parse_calendar(html)
+        except requests.exceptions.RequestException as e:
+            log.error("Fetch failed: %s", e)
+            if cached is not None:
+                # Stale-but-real beats a hard failure -- serve the last good
+                # copy rather than bouncing every client until the next
+                # successful fetch. Its own timestamp is left untouched, so
+                # the very next request tries a fresh fetch again rather
+                # than treating this as having refreshed the cache.
+                log.warning("Serving stale cached /calendar?range=%s events after a failed refresh", range)
+                return cached["events"]
+            raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
+        except RuntimeError as e:
+            log.error("Parse failed: %s", e)
+            if cached is not None:
+                log.warning("Serving stale cached /calendar?range=%s events after a failed refresh", range)
+                return cached["events"]
+            raise HTTPException(status_code=502, detail=str(e))
+
+        _calendar_cache[range] = {"events": events, "fetched_at": time.monotonic()}
+        return events
+
+
 # --- API endpoints ---------------------------------------------------------
 
 @app.get("/health")
@@ -598,23 +663,23 @@ def get_calendar(range: str = Query("week", pattern="^(day|week)$")):
     range=week -> this week's events (default)
     """
     filters = load_filters()
-
-    try:
-        html = fetch_calendar_html(range)
-        events = parse_calendar(html)
-    except requests.exceptions.RequestException as e:
-        log.error("Fetch failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
-    except RuntimeError as e:
-        log.error("Parse failed: %s", e)
-        raise HTTPException(status_code=502, detail=str(e))
+    events = get_cached_events(range)
 
     # Forex Factory has no server-side filtering by impact/currency the way
     # investing.com's importance=/countries= params did -- day/week is the
     # only thing its own URL controls. Importance/currency selection is
     # applied here instead, after scraping the full unfiltered response.
+    #
+    # dict(e), not e itself: events now comes from get_cached_events()'s
+    # shared cache, not a fresh parse per request -- apply_column_filter()
+    # below mutates each event dict in place (blanking excluded columns),
+    # which used to be harmless when every request got its own freshly
+    # parsed list. Against the cache, that mutation would corrupt it for
+    # every other request sharing that entry (e.g. one client excluding
+    # "actual" permanently blanking it for everyone else until the next
+    # real fetch) -- copying here keeps the cached originals untouched.
     events = [
-        e for e in events
+        dict(e) for e in events
         if e["impact_level"] in filters["importance"] and e["currency"] in filters["currencies"]
     ]
     events = apply_column_filter(events, filters["columns"])

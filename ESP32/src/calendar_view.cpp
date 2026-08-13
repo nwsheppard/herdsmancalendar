@@ -115,6 +115,23 @@ void refresh_task(void * param)
     result->range = *static_cast<String *>(param);
     delete static_cast<String *>(param);
 
+    // Diagnostics for a still-unexplained failure mode: reported directly
+    // that /calendar and /filters both started failing with read-timeouts
+    // (status -11) every single retry for 11+ minutes straight, with WiFi
+    // never reporting disconnected and the LXC's own access log showing no
+    // record of these requests ever arriving -- and it needed a reboot to
+    // recover, not just time. That combination (works, then every new
+    // connection silently fails, only a reboot clears it) is the classic
+    // signature of a leaked resource on this side, most likely lwIP's own
+    // small fixed socket table or heap fragmentation from repeated
+    // HTTPClient/String churn across retries -- not a server-side or
+    // WiFi-radio problem. Logged unconditionally (not just on failure) so
+    // a steady decline across retries -- rather than a one-off dip -- is
+    // what actually confirms a leak, the same reasoning as this file's own
+    // [stall] logging elsewhere.
+    Serial.printf("[heap] free=%u largest_free_block=%u before refresh_task fetch, t=%lums\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap(), static_cast<unsigned long>(millis()));
+
     // Same two calls refresh_events() used to make directly -- just now off
     // the LVGL task. Neither touches any lv_obj_t, only calendar_client.cpp's
     // own HTTPClient/ArduinoJson state and this function's local variables.
