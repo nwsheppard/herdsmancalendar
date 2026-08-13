@@ -1770,6 +1770,41 @@ Compiles clean (RAM 35.3%, Flash 70.6%). **Not yet confirmed on
 hardware** -- this is purely diagnostic, waiting on the next occurrence
 to actually narrow down which resource is leaking.
 
+**Follow-up, confirmed on hardware: the heap logging ruled out a leak,
+and turned up a different failure mode too.** Free heap stayed perfectly
+flat (9064 bytes, `largest_free_block=7668`) across every single retry
+over 27+ minutes straight -- not declining at all, so heap fragmentation
+isn't the cause. One retry in that same window also failed with a
+*different* HTTPClient status (-5, "connection lost", after 45s) instead
+of the usual -11 full-timeout -- a response that started arriving and
+then dropped, not just never arriving at all. Combined with the earlier
+`journalctl` evidence (zero record of any of these requests reaching the
+LXC) and WiFi never reporting disconnected, this doesn't look like a
+resource leak or a server-side stall -- it looks like a stale low-level
+network path on the ESP32 itself (most likely an ARP cache entry gone
+bad), which `WiFi.status()` has no way to detect since the 802.11
+association itself never actually dropped. That's also why nothing in
+`loop()`'s existing `WiFi.reconnect()` backstop ever caught it -- that
+only fires when WiFi reports disconnected, which it never did here. Only
+a full device reboot cleared it.
+
+Added `wifi_force_reconnect()` (`wifi_manager.cpp`/`.h`) -- a plain
+`WiFi.disconnect()` + `WiFi.reconnect()` cycle, forcing fresh 802.11
+association and a fresh DHCP lease without powering down the radio or
+needing credentials passed again. `calendar_view.cpp`'s
+`apply_ready_refresh_result()` now counts consecutive `/calendar` fetch
+failures (reset on any success) and calls it once the count reaches
+`consecutive_failure_reconnect_threshold` (3, roughly 6-8 minutes at the
+2-minute retry cadence) instead of waiting on a manual reboot to clear
+whatever's stuck. This is a workaround for the symptom, not a root cause
+fix -- there's no way to inspect the ESP32's live ARP table or ferry that
+diagnosis further without local hardware access, and a forced reconnect
+is a reasonable, low-risk recovery path regardless of the exact
+underlying cause. Compiles clean (RAM 35.3%, Flash 70.7%). **Not yet
+confirmed on hardware** whether this actually clears the stuck state when
+it recurs, or whether it needs a longer per-attempt wait to let the new
+association/DHCP lease actually settle before the next fetch retries.
+
 **Mitigation instead of a fix: reported directly that the glitch shows up
 shortly after a refresh specifically, and that constant refreshing isn't
 actually needed -- only around the times events are scheduled.** Can't
@@ -1872,6 +1907,167 @@ passing an out-of-range value gets a compiler warning at the call site
 instead of a silent runtime wraparound. Compiles clean, same RAM/Flash.
 **Not yet confirmed on hardware** whether a real `/calendar` fetch now
 completes successfully within the corrected budget.
+
+**Follow-up, confirmed on hardware: a sharper root cause, from timing.**
+The boot-time fetch worked instantly (7.5s, normal). The very next fetch
+-- the first one after a full hour of zero network activity
+(`poll_interval_ms`) -- failed to even connect (-1, a connect-timeout,
+not a read-timeout). `WiFi.status()` stayed `WL_CONNECTED` the whole time
+with no disconnect event, and RSSI at the following forced reconnect was
+-33 -- a strong signal, ruling out a weak/degraded RF link. Solid signal,
+no disconnect event, connection quietly stops working after sitting idle,
+only a fresh reassociation fixes it: that matches a known behavior on
+some routers/APs -- silently dropping a station's association state after
+an idle period without ever sending a real deauth frame the client could
+react to. There's no way to detect that from the ESP32's side; nothing
+tells it anything changed.
+
+Also surfaced in this same log: `wifi_force_reconnect()` raced
+`WiFi.setAutoReconnect(true)`'s own automatic reconnect --
+`WiFi.disconnect()` kicked off auto-reconnect immediately, and the
+explicit `WiFi.reconnect()` 100ms later got rejected by ESP-IDF (`sta is
+connecting, return error`), so the forced reconnect didn't actually take
+effect that time. Fixed by sharing one cooldown timestamp between
+`wifi_force_reconnect()` and `loop()`'s own down-detection backstop
+(`wifi_reconnect_if_down()`, `wifi_manager.cpp`/`.h`) instead of two
+independent timers -- see that function's own header comment for the full
+mechanism.
+
+For the idle-association root cause itself: rather than shortening
+`poll_interval_ms` (deliberately lengthened to reduce frame-shift glitch
+exposure -- see Milestone 8 above) and giving back that reduction, added
+a much cheaper keep-alive instead. `wifi_keepalive_poll()` (`main.cpp`)
+pings `/health` every 5 minutes -- a plain local check on
+`calendar_api.py`'s own LXC with no FlareSolverr/upstream round trip
+involved, normally well under 100ms -- specifically to keep the AP
+association itself active between the real hourly calendar fetches,
+without adding meaningfully to the radio-active time the frame-shift
+glitch correlates with. Runs off the LVGL task via its own background
+task (`wifi_keepalive_task`), same reasoning as `calendar_view.cpp`'s
+`refresh_task()` -- a zombied connection could still take up to
+`/health`'s own timeout to fail, which would otherwise freeze the screen
+for that long. Compiles clean (RAM 35.3%, Flash 70.7%). **Not yet
+confirmed on hardware** whether keeping the connection warm actually
+prevents the idle-association drop from happening in the first place.
+
+**Follow-up, confirmed on hardware: the keep-alive disproved its own
+premise, and pointed at the real bug.** Every 5-minute `/health` ping
+succeeded for the full hour, including the one just 5 minutes before the
+failure -- ruling out an idle-association drop entirely, since the
+connection was never actually idle. At the exact same `t=3600070ms` mark
+as every previous occurrence, everything broke again -- and this time
+`/health` failed too, not just `/filters`/`/calendar`. The tell:
+`wifi_keepalive_interval_ms` (5 min) divides evenly into
+`poll_interval_ms` (1 hour), so the keep-alive task and the hourly
+calendar-refresh task are *guaranteed* to fire in the same instant every
+hour -- both are separate FreeRTOS tasks, each opening its own
+`HTTPClient` connection concurrently. `HTTPClient`/`WiFiClient` were never
+designed for concurrent use from multiple tasks; two simultaneous
+connection attempts colliding at the WiFiClient/lwIP layer corrupting
+shared, non-reentrant state explains everything observed across every
+occurrence of this bug: works fine under normal (serialized) use, an
+exact-interval collision breaks it, and the corruption persists across
+many subsequent (individually serial, but now permanently broken) retries
+until a reboot resets the whole stack.
+
+Fixed at the actual chokepoint: added a mutex (`http_mutex()`,
+`calendar_client.cpp`) around the entirety of `http_get()` and
+`calendar_client_save_filters()`'s own `HTTPClient` POST -- every HTTP
+call this project makes, from every caller (both background tasks, and
+Settings screens calling `calendar_client_*` synchronously from the LVGL
+task). Two calls that land at the same instant now serialize instead of
+running concurrently, regardless of whether their trigger intervals
+happen to line up -- fixes the actual bug (unsynchronized concurrent
+access) rather than the specific symptom (this one exact collision).
+Function-local static `SemaphoreHandle_t`, not a namespace-scope global,
+so its one-time initialization is C++11-guaranteed thread-safe without
+depending on static-initialization-order relative to FreeRTOS's own
+scheduler startup. Compiles clean (RAM 35.3%, Flash 70.7%). **Not yet
+confirmed on hardware** whether this actually prevents the corruption on
+the next hourly collision.
+
+**Follow-up, confirmed on hardware: the mutex wasn't the whole story.**
+The very next boot failed the exact same way -- `/calendar` timed out
+once (-11 at 65s), and every request after it (including plain `/filters`)
+kept failing too, all before the WiFi keep-alive had even fired once (its
+first tick isn't due until 5 minutes in) -- so this specific occurrence
+had no concurrent second task involved at all. Tested the LXC directly
+while the ESP32 was stuck: `/health`, `/filters`, and `/calendar` all
+answered instantly and correctly. The server was never the problem, and
+neither, this time, was concurrent access -- a *single* request that runs
+all the way to its own read-timeout is apparently enough on its own to
+break every request after it.
+
+Read through the vendored `HTTPClient.cpp` for why: `disconnect()`
+(called from `end()`) only forces the underlying socket closed
+(`_client->stop()`) when `_canReuse` is false. `_canReuse` gets set `true`
+as soon as a response's headers start arriving -- meaning a request that
+times out *after* headers begin (exactly what a read-timeout is) leaves
+`disconnect()` believing the connection should be kept open for reuse
+instead of torn down. The destructor does still call `_client->stop()` as
+a backstop when the `HTTPClient` object itself goes out of scope, so this
+isn't a proven leak, but it's a real gap given the observed symptom.
+Addressed two ways: `http.setReuse(false)` on both `http_get()` and
+`calendar_client_save_filters()`'s POST, forcing a hard socket close every
+time regardless of `_canReuse` -- costs nothing, since every call here
+already constructs a brand-new `HTTPClient` object with no actual
+keep-alive reuse happening across our own requests to begin with. And
+`consecutive_failure_reconnect_threshold` (`calendar_view.cpp`) dropped
+from 3 to 1 -- waiting for a clearer pattern before self-healing no longer
+makes sense once a single failure has repeatedly been shown to already
+carry the same signal three would; it was only ever costing several more
+minutes of guaranteed-doomed retries first. Compiles clean (RAM 35.3%,
+Flash 70.7%). **Not yet confirmed on hardware** whether `setReuse(false)`
+actually addresses the underlying cause, or whether the more aggressive
+self-heal threshold is just recovering faster from something still not
+fully understood.
+
+## 2026-08: the real fix was on the server side
+
+Every entry above treated the symptom from the ESP32 side -- reasonably,
+since that's where the failures showed up, but reported directly as
+"this feels very fragile" once it kept recurring even after the mutex,
+`setReuse(false)`, and the aggressive self-heal threshold. The actual
+underlying problem was architectural: `calendar_api.py`'s `/calendar`
+was answering every request by fetching from Forex Factory through
+FlareSolverr *inline*, and the ESP32, as the primary (often only) client,
+was the one consistently left holding that multi-second-to-65s cost, no
+matter how much the firmware defended itself against the fallout.
+
+Restructured `calendar_api.py` (see its own README/module docstring) so a
+background thread on the LXC refreshes the calendar cache on its own
+schedule, and `/calendar` always just reads from it -- a plain local dict
+lookup, same cost profile as `/health`/`/filters` always had. Nothing
+that answers a client request talks to FlareSolverr anymore.
+
+With that in place, three ESP32-side changes followed directly:
+- `calendar_client_get_calendar()`'s special 65s timeout reverted to the
+  plain `default_timeout_ms` (8s, same as every other endpoint) --
+  `/calendar` no longer has a reason to need longer than that.
+- `poll_interval_ms` (`calendar_view.cpp`) reverted from an hour back
+  to 10 minutes, the brief's own original suggested cadence. It was only
+  ever lengthened to reduce how often a multi-second FlareSolverr fetch
+  could give the frame-shift glitch a window to trigger in -- with
+  `/calendar` fast again, that justification is gone.
+- Removed `wifi_keepalive_poll()`/`wifi_keepalive_task()` (`main.cpp`)
+  entirely -- it was built on the idle-association theory from earlier in
+  this same section, which the keep-alive itself ended up disproving (the
+  connection was never actually idle when the failure recurred). With
+  `poll_interval_ms` back to 10 minutes, the real calendar poll exercises
+  the network at least that often anyway, making a separate keep-alive
+  redundant -- and removing it also removes one more source of the
+  concurrent-HTTPClient-access pattern the mutex above now has to guard
+  against, for no remaining benefit.
+
+The mutex (`http_mutex()`), `setReuse(false)`, and the
+`consecutive_failure_reconnect_threshold` of 1 are all left in place --
+still reasonable defense-in-depth for whatever genuinely rare hiccup
+might still happen (an LXC restart, a real WiFi drop), just no longer
+compensating for a backend design that guaranteed the ESP32 would
+regularly hit multi-second-to-65s waits. Compiles clean (RAM 35.3%,
+Flash 70.7%). **Not yet confirmed on hardware** -- this is the fix
+expected to actually resolve the whole saga above, rather than another
+layer of defense against it.
 
 ## Roadmap (from the brief, plus Milestones 4 and 6 which weren't in it)
 

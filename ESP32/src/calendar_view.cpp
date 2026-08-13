@@ -12,23 +12,32 @@
 #include "fonts.h"
 #include "settings_screen.h"
 #include "theme.h"
+#include "wifi_manager.h"
 
 namespace {
 
 // Was 10 minutes (the brief's own suggested cadence for an economic
 // calendar -- "every 5-15 minutes is typical... don't hammer the
-// source"), but every refresh rebuilds the whole event list
-// (clear_list_yielding() + populate_events(), see below) and that rebuild
-// is where the frame-shift glitch has actually been observed to trigger
-// (see the README's Milestone 8 writeup) -- 10 minutes meant up to ~144
-// of these a day regardless of whether anything calendar-relevant was
-// happening. alert_manager_tick() (alert_manager.cpp) already refreshes
+// source"), lengthened to an hour (2026-08) specifically because every
+// refresh rebuilds the whole event list (clear_list_yielding() +
+// populate_events(), see below) and that rebuild is where the frame-shift
+// glitch has actually been observed to trigger (see the README's
+// Milestone 8 writeup) -- combined with calendar_api.py routing /calendar
+// through FlareSolverr inline at the time (several seconds of WiFi-radio
+// activity per fetch, sometimes far longer), every refresh was a real
+// chance at the glitch, not just LVGL churn.
+//
+// Back to 10 minutes (2026-08, later the same investigation):
+// calendar_api.py was restructured so a background thread on the LXC
+// refreshes its own cache on a schedule, and /calendar always just reads
+// from it -- no more FlareSolverr round trip inline, no more multi-second
+// radio-active window per fetch. That was the actual justification for
+// throttling this down to once an hour in the first place; with it gone,
+// there's no longer a reason to give up the brief's own original cadence.
+// alert_manager_tick() (alert_manager.cpp) still separately refreshes
 // 30-40s after each event's own scheduled time to pick up actual/forecast
-// values as they land, so freshness right around real events doesn't
-// depend on this periodic poll at all -- this one is now just a
-// once-an-hour backstop to catch newly-added/updated events and roll the
-// Day tab to the next day overnight, not a constant drumbeat.
-constexpr uint32_t poll_interval_ms = 60 * 60 * 1000;
+// values as they land, independent of this poll either way.
+constexpr uint32_t poll_interval_ms = 10 * 60 * 1000;
 
 // Used instead of poll_interval_ms right after a failed refresh (server
 // unreachable, WiFi blip, etc.) -- reported directly from hardware that a
@@ -47,6 +56,30 @@ uint32_t last_poll_ms = 0;
 // refresh_events() call, not calendar_view_poll() at all) doesn't cause an
 // immediate second fetch.
 bool last_refresh_ok = true;
+
+// Confirmed directly on hardware: WiFi.status() can keep reporting
+// WL_CONNECTED while every fetch silently fails (request sent, no response
+// ever arrives), persisting for 25+ minutes across many retries with a
+// perfectly flat free-heap reading (ruling out a leak) until the device
+// was rebooted -- something below WiFi's own connected/disconnected
+// status was stuck (most likely a stale ARP entry), and nothing in
+// loop()'s existing WiFi.reconnect() backstop could ever trigger on it,
+// since that only fires when WiFi itself reports disconnected. This counts
+// consecutive failures across refreshes (reset on any success) and forces
+// a full reconnect via wifi_force_reconnect() once it crosses
+// consecutive_failure_reconnect_threshold, rather than waiting on a manual
+// reboot to clear whatever's actually stuck.
+//
+// Threshold is 1, not a higher number that would wait for a clearer
+// pattern first: confirmed directly on hardware, multiple times now, that
+// a single /calendar read-timeout is already enough to break every
+// request after it (not just repeated failures confirming something's
+// really stuck) -- waiting for more failures first just means several
+// more minutes of guaranteed-doomed retries (each its own up-to-65s
+// blocking wait) before recovery starts, with no benefit, since a single
+// failure already carries the same signal three would.
+int consecutive_refresh_failures = 0;
+constexpr int consecutive_failure_reconnect_threshold = 1;
 
 lv_obj_t * calendar_screen_ref = nullptr;
 lv_obj_t * wifi_icon_label = nullptr;
@@ -739,6 +772,16 @@ void apply_ready_refresh_result()
     // discarded as stale below, since it still reflects whether the fetch
     // itself actually reached the server just now.
     last_refresh_ok = result->success;
+
+    if (result->success) {
+        consecutive_refresh_failures = 0;
+    } else {
+        ++consecutive_refresh_failures;
+        if (consecutive_refresh_failures >= consecutive_failure_reconnect_threshold) {
+            consecutive_refresh_failures = 0;
+            wifi_force_reconnect();
+        }
+    }
 
     // current_range may have changed (a tab switch) while this fetch was in
     // flight -- applying a result fetched for the tab the user has since

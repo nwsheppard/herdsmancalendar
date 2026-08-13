@@ -93,9 +93,10 @@ volatile bool wifi_icon_state_dirty = false;
 // itself on every arduino-esp32 core version/disconnect reason -- it's a
 // known quirk that the AP coming back doesn't always trigger a retry on
 // its own. loop() backstops it with an explicit periodic WiFi.reconnect()
-// while disconnected, rather than trusting the built-in mechanism alone.
+// while disconnected, rather than trusting the built-in mechanism alone --
+// see wifi_reconnect_if_down() (wifi_manager.cpp) for why that backstop's
+// cooldown timer now lives there instead of a local variable here.
 constexpr uint32_t wifi_reconnect_interval_ms = 10000;
-uint32_t last_wifi_reconnect_attempt_ms = 0;
 
 // Stall/glitch diagnostics -- see loop()'s own comment. Same threshold as
 // calendar_view.cpp's timed_timer_handler(): a couple of frames' worth
@@ -541,14 +542,7 @@ void loop()
         apply_pending_wifi_icon_state();
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
-        const uint32_t now = millis();
-        if (now - last_wifi_reconnect_attempt_ms >= wifi_reconnect_interval_ms) {
-            last_wifi_reconnect_attempt_ms = now;
-            Serial.println("WiFi still down, retrying...");
-            WiFi.reconnect();
-        }
-    }
+    wifi_reconnect_if_down(wifi_reconnect_interval_ms);
 
     poll_serial_commands();
     calendar_view_poll();

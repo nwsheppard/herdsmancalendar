@@ -29,6 +29,29 @@ browser -- confirmed directly that the HTML it returns has the exact same
 calendar__* markup as before, so parse_calendar() below needed zero
 changes, only how the HTML gets fetched in the first place.
 
+Also 2026-08: /calendar used to trigger its own FlareSolverr round trip
+inline, inside whichever request happened to arrive after a short-lived
+cache went stale. Reported directly, repeatedly, from the ESP32 (the
+primary client): slow fetches, and outright timeouts once its own
+HTTPClient budget couldn't cover FlareSolverr's worst case. Restructured so
+nothing that answers a request ever talks to FlareSolverr -- a background
+thread (_calendar_refresh_loop()) refreshes both ranges on its own
+schedule, and /calendar always just reads whatever's currently cached, a
+plain dict lookup. Any client can now poll as often as it likes without
+ever paying FlareSolverr's latency itself. That schedule isn't a single
+fixed interval (2026-08, refined further): CALENDAR_REFRESH_INTERVAL_LONG_S
+(3h) is the steady-state cadence, switching to the much shorter
+CALENDAR_REFRESH_INTERVAL_SHORT_S (5min) whenever a cached event is within
+CALENDAR_EVENT_PROXIMITY_WINDOW_S of right now -- reported directly that a
+flat 5-minute cadence was more load against Forex Factory than the data
+(which only actually changes around events' own scheduled times)
+justifies, but a long fixed interval alone would've silently broken the
+ESP32's own alert_manager_tick() post-event refresh (alert_manager.cpp),
+which only finds anything new if this cache happened to have refreshed
+recently enough to have it. See get_cached_events()/_refresh_calendar_cache()/
+_calendar_needs_short_cadence() for the mechanics, and
+lifespan() for the one-time synchronous initial fetch at startup.
+
 Also discovered at the same time (2026-08): Forex Factory geolocates an
 anonymous visitor's timezone from their IP by default, not a fixed zone --
 confirmed directly, this LXC's outbound IP got America/Sao_Paulo, which is
@@ -69,18 +92,24 @@ NOTE ON MAINTENANCE: this scrapes forexfactory.com's HTML, which can change
 without notice. If events stop appearing, the first thing to check is
 whether the CSS selectors below (WIDGET_TABLE_CLASS, calendar__* cell
 classes, IMPACT_ICON_SUFFIX_LEVELS) still match the live page — view-source
-the calendar URL and compare. If instead every request fails outright
-("Upstream fetch failed"/"FlareSolverr couldn't fetch the calendar"),
-check FlareSolverr itself first (is it running, is FLARESOLVERR_URL
-correct, can it still solve the challenge right now -- Cloudflare's own
-challenge mechanics can change too) before assuming this file's selectors
-are the problem. If event times look off by a fixed offset instead
+the calendar URL and compare. Fetch failures no longer surface to clients
+directly (see the background-refresh restructuring above) -- a client only
+ever sees a 503 in the narrow window right after a fresh start before the
+first background refresh has landed; every other failure just logs
+("Background refresh of /calendar?range=... failed: ...") and keeps
+serving the last good cached copy. Check this service's own logs
+(`journalctl -u herdsman-calendar-api` / `docker logs`) for the real
+reason, not the client response. If every refresh is failing, check
+FlareSolverr itself first (is it running, is FLARESOLVERR_URL correct, can
+it still solve the challenge right now -- Cloudflare's own challenge
+mechanics can change too) before assuming this file's selectors are the
+problem. If event times look off by a fixed offset instead
 (commonly reported as "+1 hour"), that's the timezone self-heal in
 fetch_calendar_html() -- check ff_session.json isn't stuck on a stale
 fftimezone, or delete it to force a fresh /timezone fix on the next fetch.
 """
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 from curl_cffi import requests
@@ -88,6 +117,8 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
 import json
 import logging
 import os
@@ -107,7 +138,25 @@ async def lifespan(app: FastAPI):
     # restarting/updating the service and checking for the file right after
     # (nothing to look at yet, no filters set, no obvious reason why).
     load_filters()
+
+    # Synchronous, not left to the background thread's first cycle: this
+    # blocks startup for as long as it takes (up to ~65s x2 in the worst
+    # case, both ranges needing a timezone self-heal), but that's a
+    # one-time cost paid once per restart, not something every client pays
+    # -- and it means /calendar has real data to serve from the moment
+    # this service starts accepting requests, rather than a guaranteed
+    # 503 window right after every restart. Logged but non-fatal if it
+    # fails (e.g. FlareSolverr isn't reachable yet at boot) -- the
+    # background loop below retries on its own regardless.
+    for range in ("day", "week"):
+        _refresh_calendar_cache(range)
+
+    refresh_thread = threading.Thread(target=_calendar_refresh_loop, daemon=True, name="calendar-refresh")
+    refresh_thread.start()
+
     yield
+
+    _calendar_refresh_stop.set()
 
 
 app = FastAPI(title="Herdsman Trading Terminal Calendar API", lifespan=lifespan)
@@ -116,6 +165,13 @@ app = FastAPI(title="Herdsman Trading Terminal Calendar API", lifespan=lifespan)
 
 BASE_URL = "https://www.forexfactory.com/calendar"
 BASE_URL_ROOT = "https://www.forexfactory.com"
+
+# The timezone the Forex Factory session is pinned to (see
+# _set_forex_factory_timezone()) -- also what event day/time strings in the
+# scraped HTML are expressed in, so this doubles as the zone used to parse
+# them back into real timestamps (see _parse_event_datetime()).
+FOREX_FACTORY_TIMEZONE_NAME = "America/New_York"
+CALENDAR_TIMEZONE = ZoneInfo(FOREX_FACTORY_TIMEZONE_NAME)
 
 # Required -- Forex Factory now sits behind a Cloudflare JS challenge
 # (confirmed directly, 2026-08: a plain request, even with curl_cffi's TLS
@@ -149,28 +205,59 @@ FILTERS_PATH = FILTERS_DIR / "filters.json"
 # filters.json does, via the same volume mount. See _set_forex_factory_timezone().
 SESSION_PATH = FILTERS_DIR / "ff_session.json"
 
-# Every /calendar request used to trigger its own FlareSolverr round trip
-# (a real headless browser solving Forex Factory's Cloudflare challenge --
-# 6s with a warm session, up to 65s if the timezone self-heal kicks in, see
-# fetch_calendar_html()) -- with the ESP32 polling on its own schedule plus
-# retrying on failure, and anyone loading the calendar in a browser on top
-# of that, every one of those was paying that full cost independently, even
-# though the underlying data only actually changes on Forex Factory's own
-# schedule, not every few seconds. Cached per range (day/week fetch
-# different URLs/content) so only the first request after the cache goes
-# stale pays for a real fetch -- everyone else in that window gets it back
-# immediately. Keyed in-process (not persisted) -- a restart just means the
-# next request repays the fetch once, same as before this existed.
-CALENDAR_CACHE_TTL_S = 5 * 60
+# /calendar used to trigger its own FlareSolverr round trip inline, inside
+# whichever request happened to arrive after a 5-minute TTL cache went
+# stale (a real headless browser solving Forex Factory's Cloudflare
+# challenge -- 6s with a warm session, up to 65s if the timezone self-heal
+# kicks in, see fetch_calendar_html()). With the ESP32 as the primary (often
+# only) client, it was consistently the one left holding that cost --
+# reported directly, repeatedly, as slow fetches and outright timeouts on
+# hardware with a much smaller HTTPClient timeout budget than this service
+# gives itself. The underlying data only actually changes on Forex
+# Factory's own schedule anyway, not on whenever a client happens to ask.
+#
+# Restructured so nothing that answers a request ever talks to FlareSolverr:
+# a single background thread (_calendar_refresh_loop(), started from
+# lifespan()) refreshes both ranges on its own clock, and /calendar always
+# just reads whatever's currently cached -- a plain dict lookup, no network
+# call, no wait, regardless of how slow or flaky FlareSolverr/Cloudflare are
+# being at that moment. The ESP32 (or anything else) can poll as often as it
+# wants now without ever paying FlareSolverr's latency itself. A refresh
+# failure just leaves the previous cache entry in place untouched (see
+# _refresh_calendar_cache()) -- stale-but-real beats a hard failure, and the
+# next cycle tries again on its own regardless of whether anyone's asking.
+#
+# Two cadences, not one fixed interval: reported directly that a flat
+# 5-minute cadence around the clock was more load against Forex Factory/
+# FlareSolverr than the data justifies -- events only actually change
+# (actual/forecast values landing, revisions) around their own scheduled
+# times, not continuously. CALENDAR_REFRESH_INTERVAL_LONG_S is the
+# steady-state cadence the rest of the time (still enough to catch newly
+# added/removed/rescheduled events reasonably promptly); the loop switches
+# to CALENDAR_REFRESH_INTERVAL_SHORT_S whenever today's cached events
+# include one within CALENDAR_EVENT_PROXIMITY_WINDOW_S of right now (see
+# _calendar_needs_short_cadence()). This isn't just about politeness to
+# Forex Factory -- the ESP32's own alert_manager_tick() already refreshes
+# 30-40s after each event's scheduled time specifically to pick up
+# actual/forecast values as they land (alert_manager.cpp), and that only
+# actually finds anything new if this cache has itself refreshed recently
+# enough to have it -- a 3-hour blind spot around the exact moments that
+# matter most would silently break that entirely.
+CALENDAR_REFRESH_INTERVAL_LONG_S = 3 * 60 * 60
+CALENDAR_REFRESH_INTERVAL_SHORT_S = 5 * 60
+# How far before/after an event's scheduled time counts as "coming up" --
+# starts the short cadence early enough to already be refreshing frequently
+# going into the release, and keeps it up afterward long enough to catch a
+# late-arriving actual value or a same-day revision, not just the instant
+# of the release itself.
+CALENDAR_EVENT_PROXIMITY_WINDOW_S = 30 * 60
 _calendar_cache: dict[str, dict] = {}
-# Held for the *entire* refetch, not just the cache read/write -- without
-# this, several requests arriving while the cache is stale would each kick
-# off their own concurrent FlareSolverr round trip (the exact pile-up
-# reported from hardware: a slow /calendar fetch left the whole process too
-# busy to even answer /filters). With it, the first one in refetches while
-# everyone else waits on the lock and then reads the now-fresh cache
-# instead of triggering their own fetch.
+# Protects concurrent dict access between the one background writer thread
+# and however many request-handling threads are reading at once -- not
+# guarding against concurrent *fetches* anymore, since only the background
+# thread ever calls fetch_calendar_html() now.
 _calendar_cache_lock = threading.Lock()
+_calendar_refresh_stop = threading.Event()
 
 DEFAULT_FILTERS = {
     "importance": [2, 3],
@@ -367,7 +454,7 @@ def _set_forex_factory_timezone(cookies: list) -> list:
         "request.post",
         f"{BASE_URL_ROOT}/timezone",
         cookies=cookies_after_get,
-        post_data=f"_csrf={csrf_match.group(1)}&timezone=America%2FNew_York",
+        post_data=f"_csrf={csrf_match.group(1)}&timezone={quote(FOREX_FACTORY_TIMEZONE_NAME, safe='')}",
     )
     return _merge_cookies(cookies_after_get, post_solution.get("cookies", []))
 
@@ -411,17 +498,18 @@ def fetch_calendar_html(cal_type: str) -> str:
     # cf_clearance without fftimezone, an expired session, etc), not on
     # every single fetch.
     tz_match = re.search(r"timezone_name[\"']?\s*[:=]\s*[\"']([^\"']+)", html)
-    if not tz_match or tz_match.group(1) != "America/New_York":
-        log.info("Forex Factory session timezone is %s, not America/New_York -- fixing it", tz_match.group(1) if tz_match else "unknown")
+    if not tz_match or tz_match.group(1) != FOREX_FACTORY_TIMEZONE_NAME:
+        log.info("Forex Factory session timezone is %s, not %s -- fixing it",
+                  tz_match.group(1) if tz_match else "unknown", FOREX_FACTORY_TIMEZONE_NAME)
         cookies = _set_forex_factory_timezone(cookies)
         solution = _flaresolverr_request("request.get", url, cookies=cookies)
         html = solution.get("response", "")
         cookies = _merge_cookies(cookies, solution.get("cookies", []))
 
         tz_match = re.search(r"timezone_name[\"']?\s*[:=]\s*[\"']([^\"']+)", html)
-        if not tz_match or tz_match.group(1) != "America/New_York":
+        if not tz_match or tz_match.group(1) != FOREX_FACTORY_TIMEZONE_NAME:
             raise RuntimeError(
-                f"Set Forex Factory's timezone to America/New_York but the calendar still shows "
+                f"Set Forex Factory's timezone to {FOREX_FACTORY_TIMEZONE_NAME} but the calendar still shows "
                 f"{tz_match.group(1) if tz_match else 'no timezone at all'} -- not retrying again to avoid looping forever"
             )
 
@@ -610,43 +698,169 @@ def apply_column_filter(events: list[dict], columns: list[str]) -> list[dict]:
     return events
 
 
+_MONTH_ABBREVS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_EVENT_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})(am|pm)$")
+
+
+def _parse_event_datetime(day: str, time_str: str, reference: datetime) -> datetime | None:
+    """
+    Parses an event's "day" ("Fri Jul 27") + "time" ("8:30am") fields into
+    an aware datetime in CALENDAR_TIMEZONE -- mirrors the ESP32's own
+    alert_manager.cpp parse_event_timestamp() field-by-field, so "does this
+    event count as happening soon" means the same thing on both sides.
+    Returns None for events with no fixed time ("All Day"/"Tentative"/"")
+    or malformed day text, same as that function.
+    """
+    if not day or not time_str:
+        return None
+
+    # Skip the weekday abbreviation ("Fri Jul 27" -> "Jul 27").
+    day_parts = day.split(None, 1)
+    if len(day_parts) != 2:
+        return None
+    month_and_day = day_parts[1].split()
+    if len(month_and_day) != 2:
+        return None
+    month = _MONTH_ABBREVS.get(month_and_day[0].lower())
+    if month is None or not month_and_day[1].isdigit():
+        return None
+    day_num = int(month_and_day[1])
+
+    time_match = _EVENT_TIME_RE.match(time_str.strip().lower())
+    if not time_match:
+        return None
+    hour, minute, meridiem = int(time_match[1]), int(time_match[2]), time_match[3]
+    if not (1 <= hour <= 12 and 0 <= minute <= 59):
+        return None
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    if meridiem == "am" and hour == 12:
+        hour = 0
+
+    year = reference.year
+    # The only case a day/week-range fetch can straddle a year boundary:
+    # today is December and the event's month is January, so it must be
+    # next year, not this one -- same reasoning as the ESP32's own
+    # parse_event_timestamp().
+    if reference.month == 12 and month == 1:
+        year += 1
+
+    try:
+        return datetime(year, month, day_num, hour, minute, tzinfo=CALENDAR_TIMEZONE)
+    except ValueError:
+        return None
+
+
+def _calendar_needs_short_cadence(now: datetime) -> bool:
+    """
+    True if any currently-cached "day" event falls within
+    CALENDAR_EVENT_PROXIMITY_WINDOW_S of `now` -- see
+    CALENDAR_REFRESH_INTERVAL_SHORT_S's own comment for why. Only the "day"
+    range is checked: `now` is always within today, so any event close
+    enough to matter is necessarily in that range regardless of what
+    "week" also contains.
+    """
+    with _calendar_cache_lock:
+        cached = _calendar_cache.get("day")
+    if cached is None:
+        return False
+
+    for event in cached["events"]:
+        event_dt = _parse_event_datetime(event.get("day", ""), event.get("time", ""), now)
+        if event_dt is None:
+            continue
+        if abs((event_dt - now).total_seconds()) <= CALENDAR_EVENT_PROXIMITY_WINDOW_S:
+            return True
+    return False
+
+
+def _refresh_calendar_cache(range: str) -> None:
+    """
+    Fetches + parses `range` and updates the cache -- called by
+    _calendar_refresh_loop() on its own schedule, and once more directly
+    from lifespan() at startup so the service has real data before it
+    accepts its first request. Never called from inside a request handler.
+
+    On failure, logs and returns without touching the cache -- whatever was
+    there before (possibly nothing, right after a fresh start) is left
+    exactly as it was, so get_cached_events() keeps serving the last good
+    copy rather than the request path ever seeing the failure directly.
+    """
+    try:
+        html = fetch_calendar_html(range)
+        events = parse_calendar(html)
+    except requests.exceptions.RequestException as e:
+        log.error("Background refresh of /calendar?range=%s failed: %s", range, e)
+        return
+    except RuntimeError as e:
+        log.error("Background refresh of /calendar?range=%s failed to parse: %s", range, e)
+        return
+
+    with _calendar_cache_lock:
+        _calendar_cache[range] = {"events": events, "fetched_at": time.monotonic()}
+    log.info("Refreshed /calendar?range=%s: %d events", range, len(events))
+
+
+def _calendar_refresh_loop() -> None:
+    """
+    Runs for the life of the process (started as a daemon thread from
+    lifespan(), after lifespan()'s own initial synchronous refresh).
+
+    Waits before each refresh, not after -- lifespan() already did the
+    first fetch for both ranges before this thread was even started;
+    refreshing again immediately here would just repeat that same round
+    trip a second time for no reason. Event.wait() as the loop condition
+    (rather than wait() as a plain statement inside the loop) is what makes
+    "wait first" and "stop promptly on shutdown" both fall out naturally:
+    it returns True the moment the stop Event is set, so a shutdown
+    mid-wait exits the loop immediately instead of sleeping out the full
+    interval first.
+
+    The wait itself is CALENDAR_REFRESH_INTERVAL_SHORT_S or _LONG_S,
+    decided fresh each time from whatever's currently cached (i.e. as of
+    the *previous* refresh, not this upcoming one -- see
+    _calendar_needs_short_cadence()'s own comment for why that's fine: an
+    event just outside the window on this check will be well inside it by
+    the next one either way, since the short cadence is much shorter than
+    the proximity window itself).
+    """
+    while True:
+        now = datetime.now(CALENDAR_TIMEZONE)
+        interval = (
+            CALENDAR_REFRESH_INTERVAL_SHORT_S
+            if _calendar_needs_short_cadence(now)
+            else CALENDAR_REFRESH_INTERVAL_LONG_S
+        )
+        if _calendar_refresh_stop.wait(interval):
+            return
+        for range in ("day", "week"):
+            _refresh_calendar_cache(range)
+
+
 def get_cached_events(range: str) -> list[dict]:
     """
-    Cached, unfiltered events for `range` -- fetches fresh only when the
-    cache is missing or older than CALENDAR_CACHE_TTL_S, otherwise returns
-    the cached copy immediately. Filters are intentionally not baked into
-    the cache (see get_calendar()) -- they're cheap to apply per-request,
-    and caching post-filter would mean a filter change doesn't take effect
-    until the cache happens to expire.
+    Cached, unfiltered events for `range` -- a plain dict read, never a
+    network call (see _calendar_refresh_loop()). Filters are intentionally
+    not baked into the cache (see get_calendar()) -- they're cheap to apply
+    per-request, and caching post-filter would mean a filter change doesn't
+    take effect until the next background refresh.
     """
     with _calendar_cache_lock:
         cached = _calendar_cache.get(range)
-        if cached is not None and time.monotonic() - cached["fetched_at"] < CALENDAR_CACHE_TTL_S:
-            return cached["events"]
 
-        try:
-            html = fetch_calendar_html(range)
-            events = parse_calendar(html)
-        except requests.exceptions.RequestException as e:
-            log.error("Fetch failed: %s", e)
-            if cached is not None:
-                # Stale-but-real beats a hard failure -- serve the last good
-                # copy rather than bouncing every client until the next
-                # successful fetch. Its own timestamp is left untouched, so
-                # the very next request tries a fresh fetch again rather
-                # than treating this as having refreshed the cache.
-                log.warning("Serving stale cached /calendar?range=%s events after a failed refresh", range)
-                return cached["events"]
-            raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
-        except RuntimeError as e:
-            log.error("Parse failed: %s", e)
-            if cached is not None:
-                log.warning("Serving stale cached /calendar?range=%s events after a failed refresh", range)
-                return cached["events"]
-            raise HTTPException(status_code=502, detail=str(e))
+    if cached is None:
+        # Only possible in the brief window right after a fresh start,
+        # before lifespan()'s own initial synchronous refresh has landed
+        # (or if that refresh itself failed -- e.g. FlareSolverr wasn't
+        # reachable yet at boot). The background loop keeps retrying
+        # regardless; check this service's own logs for the actual reason
+        # if this persists past a normal startup.
+        raise HTTPException(status_code=503, detail="Calendar data isn't loaded yet -- try again shortly")
 
-        _calendar_cache[range] = {"events": events, "fetched_at": time.monotonic()}
-        return events
+    return cached["events"]
 
 
 # --- API endpoints ---------------------------------------------------------
@@ -654,6 +868,18 @@ def get_cached_events(range: str) -> list[dict]:
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    # This is a JSON API with no static assets of its own -- nothing to
+    # actually serve here. Without this route, a browser hitting any
+    # endpoint directly (testing /calendar in a tab, etc.) still fires its
+    # own automatic /favicon.ico request, which fell through to FastAPI's
+    # default 404 handler. Explicit 204 instead: same "nothing here" result,
+    # but skips routing through the 404 handler and settles the browser's
+    # request immediately rather than leaving it to time out/error in devtools.
+    return Response(status_code=204)
 
 
 @app.get("/calendar")

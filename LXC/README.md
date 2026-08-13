@@ -56,10 +56,15 @@ convenient, as long as this container can reach it), then either:
   pct exec <ctid> -- systemctl restart herdsman-calendar-api
   ```
 
-Without this, every `/calendar` request fails with a clear error naming
-exactly what's missing (`FLARESOLVERR_URL is not configured...`), not a
-confusing timeout -- check `journalctl -u herdsman-calendar-api -f` if
-you're not sure whether it's set.
+Without this, the service still starts, but its background calendar
+refresh (see "How /calendar stays fast" below) can never actually
+succeed -- `journalctl -u herdsman-calendar-api -f` shows a clear
+`FLARESOLVERR_URL is not configured...` error on every refresh attempt.
+`/calendar` itself won't show that error directly to a client; it'll
+either serve nothing yet (a 503 right after a fresh start) or, if it had
+previously fetched real data before `FLARESOLVERR_URL` went missing,
+keep serving that increasingly stale copy indefinitely. Check the logs,
+not the client response, if you're not sure whether it's set.
 
 ## Quick install
 
@@ -106,6 +111,52 @@ curl http://<container-ip>:8080/health
 curl http://<container-ip>:8080/calendar?range=day
 curl http://<container-ip>:8080/calendar?range=week
 ```
+
+## How /calendar stays fast
+
+`/calendar` never talks to FlareSolverr itself -- a background thread
+refreshes both `day` and `week` caches on its own schedule
+(`calendar_api.py`), and the endpoint just reads whatever's currently
+cached, a plain dict lookup. Poll it as often as you like (the ESP32
+defaults to every 10 minutes); nothing a client does ever triggers a
+FlareSolverr round trip or waits on one.
+
+That schedule isn't a single fixed interval: `CALENDAR_REFRESH_INTERVAL_LONG_S`
+(3 hours) is the steady-state cadence, switching to the much shorter
+`CALENDAR_REFRESH_INTERVAL_SHORT_S` (5 minutes) whenever a cached event's
+scheduled time is within `CALENDAR_EVENT_PROXIMITY_WINDOW_S` (30 minutes)
+of right now. A flat 5-minute cadence around the clock turned out to be
+more load against Forex Factory than the data justifies -- events only
+actually change (actual/forecast values landing, revisions) around their
+own scheduled times, not continuously -- but a long fixed interval alone
+would've silently broken the ESP32's own `alert_manager_tick()`
+post-event refresh (`alert_manager.cpp`), which only finds anything new
+if this cache happened to have refreshed recently enough to have it.
+
+This wasn't always true, and mattered a lot in practice: it used to fetch
+inline, on whichever request happened to arrive after a short-lived cache
+went stale -- fine when the calendar loaded quickly, but once Forex
+Factory's Cloudflare challenge (below) made every fetch take several
+seconds, up to 65s in the worst case, the ESP32 (as the primary, often
+only, client) was the one left holding that cost on every trigger,
+repeatedly reported as slow loads and outright timeouts on hardware with
+a much smaller HTTPClient budget than this service gives itself.
+
+One consequence: this service's own startup now blocks for as long as
+the first fetch takes (up to ~65s x2 in the worst case, both ranges
+needing a timezone self-heal) -- `systemctl start`/`docker compose up`
+won't report ready until that's done. That's a one-time cost per restart,
+not something every client pays, and it means `/calendar` has real data
+to serve from the moment the service starts accepting requests rather
+than a guaranteed empty window right after every restart.
+
+A background refresh that fails (FlareSolverr down, Forex Factory
+serving something unexpected, etc.) just logs and leaves the previous
+cache entry untouched -- stale-but-real beats a hard failure, and the
+next cycle tries again on its own regardless of whether anyone's asking.
+The only time a client sees an actual error is a 503 in the narrow window
+right after a fresh start, before the first background refresh has
+landed at all.
 
 ## Data source: Forex Factory
 
@@ -250,22 +301,25 @@ themselves being blanked.
 
 ## Maintenance notes
 
-- If every `/calendar` request fails outright (not just missing/wrong
-  data, but every request erroring), check FlareSolverr before assuming
-  `calendar_api.py` broke: is it running, is `FLARESOLVERR_URL` set
-  correctly on this service (`systemctl cat herdsman-calendar-api` shows
-  the effective config, including any `systemctl edit` drop-in), and can
-  it still solve Forex Factory's challenge right now -- Cloudflare's own
-  challenge mechanics change too, independent of anything in this repo.
-  `journalctl -u herdsman-calendar-api -f` surfaces the specific error
-  either way -- a missing/wrong `FLARESOLVERR_URL` and a FlareSolverr-side
-  failure log differently (see `calendar_api.py`'s `fetch_calendar_html()`).
+- If `/calendar` is serving stale or empty data (see "How /calendar stays
+  fast" above -- a background refresh failure never surfaces as a client
+  error, only stale data or, right after a fresh start, a 503), check
+  `journalctl -u herdsman-calendar-api -f` for
+  `Background refresh of /calendar?range=... failed: ...` lines, then
+  check FlareSolverr before assuming `calendar_api.py` broke: is it
+  running, is `FLARESOLVERR_URL` set correctly on this service
+  (`systemctl cat herdsman-calendar-api` shows the effective config,
+  including any `systemctl edit` drop-in), and can it still solve Forex
+  Factory's challenge right now -- Cloudflare's own challenge mechanics
+  change too, independent of anything in this repo.
 - If event times look off by a fixed offset (commonly "+1 hour" during
   EDT), that's Forex Factory's IP-geolocated timezone default, not a bug in
   this scraper -- `fetch_calendar_html()` should self-heal it automatically
   via `/opt/herdsman-calendar/ff_session.json`. If it's stuck, delete that
   file (`rm /opt/herdsman-calendar/ff_session.json`) to force a fresh fix on
-  the next `/calendar` request.
+  the next background refresh (within `CALENDAR_REFRESH_INTERVAL_LONG_S`/
+  `_SHORT_S` depending on whether an event's coming up soon, or restart
+  the service to force it immediately via its own startup fetch).
 - forexfactory.com can change its HTML structure, so this service may need
   periodic selector updates. If events stop appearing, or impact levels all
   come back the same, the first things to check are `WIDGET_TABLE_CLASS`

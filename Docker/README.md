@@ -42,9 +42,15 @@ cp Docker/.env.example Docker/.env
 # edit Docker/.env, set FLARESOLVERR_URL to your instance's address
 ```
 
-Without this, every `/calendar` request fails with a clear error
-naming exactly what's missing (`FLARESOLVERR_URL is not configured...`),
-not a confusing timeout or an unrelated-looking failure.
+Without this, the container still starts, but its background calendar
+refresh (see "How /calendar stays fast" below) can never actually
+succeed -- `docker logs -f herdsman-calendar` shows a clear
+`FLARESOLVERR_URL is not configured...` error on every refresh attempt.
+`/calendar` itself won't show that error directly; it'll either serve
+nothing yet (a 503 right after a fresh start) or keep serving
+increasingly stale data if it had fetched successfully before
+`FLARESOLVERR_URL` went missing. Check the logs, not the client
+response, if you're not sure whether it's set.
 
 ## Quick start (docker compose)
 
@@ -114,6 +120,36 @@ curl http://localhost:8080/calendar?range=week
 from somewhere else on the network -- the ESP32 firmware will need that
 same address in Settings -> Calendar Server.)
 
+## How /calendar stays fast
+
+`/calendar` never talks to FlareSolverr itself -- a background thread
+refreshes both `day` and `week` caches on its own schedule
+(`calendar_api.py`), and the endpoint just reads whatever's currently
+cached. Poll it as often as you like; nothing a client does ever
+triggers a FlareSolverr round trip or waits on one.
+
+That schedule isn't a single fixed interval: `CALENDAR_REFRESH_INTERVAL_LONG_S`
+(3 hours) is the steady-state cadence, switching to the much shorter
+`CALENDAR_REFRESH_INTERVAL_SHORT_S` (5 minutes) whenever a cached event's
+scheduled time is within `CALENDAR_EVENT_PROXIMITY_WINDOW_S` (30 minutes)
+of right now -- a flat 5-minute cadence around the clock was more load
+against Forex Factory than the data (which only actually changes around
+events' own scheduled times) justifies, but a long fixed interval alone
+would've silently broken the ESP32's own post-event refresh
+(`alert_manager_tick()`, `alert_manager.cpp`), which only finds anything
+new if this cache happened to have refreshed recently enough to have it.
+
+One consequence: `docker compose up`/`docker run` won't report the
+container healthy until the first fetch completes (up to ~65s x2 in the
+worst case, both ranges needing a timezone self-heal) -- `lifespan()`
+does that fetch synchronously before the service starts accepting
+requests, so `/calendar` has real data from the moment it's reachable
+rather than a guaranteed empty window right after every start. A
+background refresh that fails afterward just logs and keeps serving the
+last good cached copy -- the only client-visible error is a 503 in the
+narrow window right after a fresh start, before the first refresh has
+landed at all.
+
 ## Updating
 
 ```bash
@@ -142,15 +178,14 @@ See [`LXC/README.md`](../LXC/README.md)'s own Maintenance notes section --
 Forex Factory scraper selector drift, past bugs found/fixed, etc. all
 apply identically here, since it's the same `calendar_api.py` either way.
 
-If `/calendar` starts failing outright (not just missing/wrong data, but
-every request erroring), check FlareSolverr itself before assuming
-`calendar_api.py` broke: is it still running, is `FLARESOLVERR_URL` in
-`Docker/.env` still correct, and can it still solve Forex Factory's
-challenge right now (Cloudflare's own challenge mechanics change too,
-independent of anything in this repo). `docker logs -f herdsman-calendar`
-surfaces the specific error either way -- a missing/wrong
-`FLARESOLVERR_URL` and a FlareSolverr-side failure look different in the
-log (see `calendar_api.py`'s `fetch_calendar_html()`).
+If `/calendar` is serving stale or empty data (see "How /calendar stays
+fast" above -- a background refresh failure never surfaces as a client
+error), check `docker logs -f herdsman-calendar` for
+`Background refresh of /calendar?range=... failed: ...` lines, then check
+FlareSolverr itself before assuming `calendar_api.py` broke: is it still
+running, is `FLARESOLVERR_URL` in `Docker/.env` still correct, and can it
+still solve Forex Factory's challenge right now (Cloudflare's own
+challenge mechanics change too, independent of anything in this repo).
 
 If event times look off by a fixed offset instead (commonly "+1 hour"
 during EDT), that's Forex Factory's IP-geolocated timezone default, not a
@@ -158,4 +193,6 @@ bug in this scraper -- `fetch_calendar_html()` self-heals it automatically
 via `ff_session.json` in the `herdsman_data` volume. If it's stuck, remove
 just that file from the volume (or `docker volume rm herdsman_data` to
 reset everything, including `filters.json`) to force a fresh fix on the
-next `/calendar` request.
+next background refresh (within `CALENDAR_REFRESH_INTERVAL_LONG_S`/
+`_SHORT_S` depending on whether an event's coming up soon, or restart
+the container to force it immediately via its own startup fetch).
