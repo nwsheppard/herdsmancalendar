@@ -33,16 +33,17 @@ SemaphoreHandle_t http_mutex()
     return mutex;
 }
 
-// Default for every endpoint except /calendar (see calendar_client_get_calendar()'s
-// own timeout below) -- these all run entirely on calendar_api.py's own LXC,
-// no upstream round-trip involved, so 8s is already generous.
+// Default for every endpoint except /calendar/wait (see
+// calendar_client_wait_for_calendar()'s own timeout below) -- these all run
+// entirely on calendar_api.py's own LXC, no upstream round-trip involved,
+// so 8s is already generous.
 //
 // uint16_t, not a rounder uint32_t: matches HTTPClient::setTimeout()'s own
 // parameter type below (tops out at 65535ms) -- confirmed directly on
 // hardware that a wider type here just moves the overflow trap to whoever
 // calls http_get() with something >65535 instead of catching it at the
 // call site, which is exactly what happened once already (see
-// calendar_client_get_calendar()'s own comment).
+// calendar_client_wait_for_calendar()'s own comment).
 constexpr uint16_t default_timeout_ms = 8000;
 
 /**
@@ -192,21 +193,21 @@ bool calendar_client_get_columns(std::vector<StringOption> & out)
     return fetch_string_options("/columns", out);
 }
 
-bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out)
+bool calendar_client_wait_for_calendar(const String & range, int since_version,
+                                       std::vector<CalendarEvent> & out, int & out_version)
 {
-    // /calendar used to route through FlareSolverr server-side inline (see
-    // calendar_api.py's old fetch_calendar_html()-per-request design),
-    // needing up to 65s of client-side timeout budget to cover that -- see
-    // this project's git history/README for that whole saga (a uint16_t
-    // overflow, a WiFiClient/lwIP corruption bug from two concurrent
-    // fetches colliding, and more). calendar_api.py was restructured
-    // (2026-08) so a background thread refreshes its cache on its own
-    // schedule and /calendar always just reads from it -- a plain local
-    // dict lookup now, same cost profile as every other endpoint here, so
-    // this uses the plain default_timeout_ms like all of them rather than
-    // a special extended one. A fetch that actually needs longer than that
-    // now means something is genuinely stuck, not FlareSolverr being slow.
-    const String body = http_get("/calendar?range=" + range);
+    // /calendar/wait blocks server-side (calendar_api.py's own
+    // CALENDAR_LONG_POLL_TIMEOUT_S) until `range`'s cached data actually
+    // changes from since_version, or that timeout elapses -- either way it
+    // always eventually answers, just not necessarily quickly. This is
+    // what gives push-like behavior without WebSockets or any new client
+    // library: still a plain HTTP GET, just one that doesn't answer
+    // instantly. 30000, not a smaller value: needs to comfortably clear
+    // the server's own wait budget, the same reasoning (and the same
+    // uint16_t-tops-out-at-65535 ceiling on setTimeout()) that already
+    // caused one real bug on the old FlareSolverr-timeout code path -- see
+    // this project's git history/README for that saga.
+    const String body = http_get("/calendar/wait?range=" + range + "&since=" + String(since_version), 30000);
     if (body.length() == 0) {
         return false;
     }
@@ -225,7 +226,7 @@ bool calendar_client_get_calendar(const String & range, std::vector<CalendarEven
     JsonDocument doc;
     const DeserializationError error = deserializeJson(doc, body);
     if (error) {
-        Serial.printf("Failed to parse /calendar response: %s\n", error.c_str());
+        Serial.printf("Failed to parse /calendar/wait response: %s\n", error.c_str());
         return false;
     }
 
@@ -253,11 +254,12 @@ bool calendar_client_get_calendar(const String & range, std::vector<CalendarEven
         result.push_back(event);
     }
 
-    Serial.printf("Parsed /calendar body: %u events in %lums, ending t=%lums\n",
+    Serial.printf("Parsed /calendar/wait body: %u events in %lums, ending t=%lums\n",
                   static_cast<unsigned>(result.size()),
                   static_cast<unsigned long>(millis() - parse_start_ms), static_cast<unsigned long>(millis()));
 
     out = result;
+    out_version = doc["version"] | since_version;
     return true;
 }
 

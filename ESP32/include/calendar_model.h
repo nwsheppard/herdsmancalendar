@@ -6,8 +6,8 @@
  * One economic calendar event, as returned by calendar_api.py's /calendar
  * endpoint. Field names/shape mirror that JSON directly (day, time,
  * currency, impact, impact_level, name, actual, forecast, previous) --
- * calendar_client_get_calendar() populates this by parsing the response,
- * and calendar_view.cpp renders it as-is.
+ * calendar_client_wait_for_calendar() populates this by parsing the
+ * response, and calendar_view.cpp renders it as-is.
  *
  * No "is_next" (highlight the upcoming event) field yet -- that needs a
  * real wall-clock time to compare each event's day/time against, which

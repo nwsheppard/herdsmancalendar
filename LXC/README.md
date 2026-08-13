@@ -110,6 +110,8 @@ restart, not just whether this particular run happened to set it.
 curl http://<container-ip>:8080/health
 curl http://<container-ip>:8080/calendar?range=day
 curl http://<container-ip>:8080/calendar?range=week
+curl "http://<container-ip>:8080/calendar/wait?range=day&since=-1"   # instant -- since=-1 always "changed"
+curl "http://<container-ip>:8080/calendar/wait?range=day&since=1"    # blocks up to CALENDAR_LONG_POLL_TIMEOUT_S
 ```
 
 ## How /calendar stays fast
@@ -157,6 +159,35 @@ next cycle tries again on its own regardless of whether anyone's asking.
 The only time a client sees an actual error is a 503 in the narrow window
 right after a fresh start, before the first background refresh has
 landed at all.
+
+## Push updates: /calendar/wait
+
+`/calendar` always answers immediately from the cache -- fine for a quick
+check, but a client that wants updates *as they happen*, without deciding
+on its own polling schedule, should use `/calendar/wait?range=day&since=<version>`
+instead. It blocks server-side for up to `CALENDAR_LONG_POLL_TIMEOUT_S`
+(25s) until `range`'s cache version actually differs from `since`, then
+returns the same shape `/calendar` does, plus a `version` field. Pass
+`since=-1` for a first call (or any time you want the current data
+immediately, no waiting) -- calendar_api.py treats that as a version that
+can never match, so it always returns right away. After that, pass back
+whatever `version` you last received to keep waiting for the next real
+change.
+
+This is what the ESP32 firmware actually uses now (see
+`calendar_view.cpp`'s `refresh_task()`/`apply_ready_refresh_result()`) --
+no WebSockets, no persistent connection to manage, just the same plain
+HTTP GET repeated in a loop, one request immediately following the last.
+A change on the backend (a new event, an actual/forecast value landing)
+reaches the screen within moments of the background thread picking it up,
+not up to a full poll interval later.
+
+A version only bumps when the underlying events actually change -- a
+background refresh that finds nothing new (the common case) doesn't wake
+any waiters. Changing filters via Settings doesn't bump it either (the
+same underlying events, just filtered differently), which is why the
+ESP32 always issues an immediate `since=-1` request right after a
+Settings change rather than waiting for its current long-poll to resolve.
 
 ## Data source: Forex Factory
 

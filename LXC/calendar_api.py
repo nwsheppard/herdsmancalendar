@@ -48,9 +48,22 @@ flat 5-minute cadence was more load against Forex Factory than the data
 justifies, but a long fixed interval alone would've silently broken the
 ESP32's own alert_manager_tick() post-event refresh (alert_manager.cpp),
 which only finds anything new if this cache happened to have refreshed
-recently enough to have it. See get_cached_events()/_refresh_calendar_cache()/
-_calendar_needs_short_cadence() for the mechanics, and
-lifespan() for the one-time synchronous initial fetch at startup.
+recently enough to have it. See _build_calendar_response()/
+_refresh_calendar_cache()/_calendar_needs_short_cadence() for the
+mechanics, and lifespan() for the one-time synchronous initial fetch at
+startup.
+
+Also 2026-08 (same investigation, taken further): reported directly as
+the actual goal -- the ESP32 should be "just the display of the webpage,"
+not something that decides on its own schedule when to go looking for
+updates. Added /calendar/wait, a long-polling variant that blocks server-
+side (CALENDAR_LONG_POLL_TIMEOUT_S) until a range's cache version actually
+changes, instead of answering immediately -- a client passes back the
+version it last received as `since` and gets woken the moment something
+new lands, or the timeout anyway if nothing did. No WebSockets, no
+persistent connection to manage on the client side, still the exact same
+plain HTTP GET /calendar already was -- see wait_for_calendar() and
+_calendar_versions.
 
 Also discovered at the same time (2026-08): Forex Factory geolocates an
 anonymous visitor's timezone from their IP by default, not a fixed zone --
@@ -80,8 +93,9 @@ countries. An old filters.json from before this switch is incompatible
 DEFAULT_FILTERS rather than migrated -- see load_filters().
 
 Endpoints:
-  GET  /calendar?range=day    -> today's events, filtered per filters.json
-  GET  /calendar?range=week   -> this week's events (default)
+  GET  /calendar?range=day               -> today's events, filtered per filters.json, answers immediately
+  GET  /calendar?range=week              -> this week's events (default), answers immediately
+  GET  /calendar/wait?range=day&since=N  -> blocks until range's data differs from version N (or times out)
   GET  /filters                -> current impact-level/currency filter selection
   POST /filters                -> update the filter selection (persisted to filters.json)
   GET  /currencies              -> all currencies Forex Factory's calendar covers, for a picker UI
@@ -251,12 +265,40 @@ CALENDAR_REFRESH_INTERVAL_SHORT_S = 5 * 60
 # late-arriving actual value or a same-day revision, not just the instant
 # of the release itself.
 CALENDAR_EVENT_PROXIMITY_WINDOW_S = 30 * 60
+
+# How long /calendar/wait holds a request open before giving up and
+# returning the (unchanged) current data anyway. A client's own HTTP
+# timeout needs to comfortably clear this (see calendar_view.cpp's
+# refresh_task() on the ESP32 side, 30s) -- kept below that with real
+# margin for network overhead, not equal to it. Not made longer just
+# because it safely could be: the ESP32 serializes all its own HTTP calls
+# through one mutex (see calendar_client.cpp's http_mutex(), and its own
+# git history for why that's necessary), so a request that's stuck waiting
+# here also blocks that client from acting on anything else (a tab switch,
+# a Settings change) until this either wakes up on a real change or times
+# out -- this value is the practical ceiling on how long that could take.
+CALENDAR_LONG_POLL_TIMEOUT_S = 25
+
 _calendar_cache: dict[str, dict] = {}
+# Bumped per range whenever a background refresh's events actually differ
+# from what was cached before (not on every refresh cycle -- most cycles
+# find nothing new) -- see _refresh_calendar_cache(). This is what
+# /calendar/wait actually waits on: a client passes back the version it
+# already has as `since`, and gets woken the moment this changes instead of
+# on a fixed timer of its own. Reported directly as the goal: the ESP32
+# should be "just the display of the webpage," reacting to changes instead
+# of deciding on its own schedule when to go looking for them.
+_calendar_versions: dict[str, int] = {}
 # Protects concurrent dict access between the one background writer thread
 # and however many request-handling threads are reading at once -- not
 # guarding against concurrent *fetches* anymore, since only the background
-# thread ever calls fetch_calendar_html() now.
+# thread ever calls fetch_calendar_html() now. Wrapped in a Condition
+# (rather than a plain Lock) so /calendar/wait can block on it directly --
+# same lock either way, `with _calendar_cache_lock` and
+# `with _calendar_cache_cond` are interchangeable for the plain dict-access
+# call sites that don't need to wait/notify.
 _calendar_cache_lock = threading.Lock()
+_calendar_cache_cond = threading.Condition(_calendar_cache_lock)
 _calendar_refresh_stop = threading.Event()
 
 DEFAULT_FILTERS = {
@@ -788,6 +830,12 @@ def _refresh_calendar_cache(range: str) -> None:
     there before (possibly nothing, right after a fresh start) is left
     exactly as it was, so get_cached_events() keeps serving the last good
     copy rather than the request path ever seeing the failure directly.
+
+    Bumps _calendar_versions[range] and wakes any /calendar/wait callers
+    only if the newly-fetched events actually differ from what was cached
+    -- most refresh cycles find nothing new, and waking every long-poll
+    waiter on a no-op refresh would defeat the point of waiting on real
+    changes rather than a timer.
     """
     try:
         html = fetch_calendar_html(range)
@@ -799,9 +847,14 @@ def _refresh_calendar_cache(range: str) -> None:
         log.error("Background refresh of /calendar?range=%s failed to parse: %s", range, e)
         return
 
-    with _calendar_cache_lock:
+    with _calendar_cache_cond:
+        previous = _calendar_cache.get(range)
+        changed = previous is None or previous["events"] != events
         _calendar_cache[range] = {"events": events, "fetched_at": time.monotonic()}
-    log.info("Refreshed /calendar?range=%s: %d events", range, len(events))
+        if changed:
+            _calendar_versions[range] = _calendar_versions.get(range, 0) + 1
+            _calendar_cache_cond.notify_all()
+    log.info("Refreshed /calendar?range=%s: %d events%s", range, len(events), "" if changed else " (unchanged)")
 
 
 def _calendar_refresh_loop() -> None:
@@ -840,16 +893,19 @@ def _calendar_refresh_loop() -> None:
             _refresh_calendar_cache(range)
 
 
-def get_cached_events(range: str) -> list[dict]:
+def _build_calendar_response(range: str) -> JSONResponse:
     """
-    Cached, unfiltered events for `range` -- a plain dict read, never a
-    network call (see _calendar_refresh_loop()). Filters are intentionally
-    not baked into the cache (see get_calendar()) -- they're cheap to apply
-    per-request, and caching post-filter would mean a filter change doesn't
-    take effect until the next background refresh.
+    Filtered events for `range` plus its current cache version, from a
+    plain dict read -- never a network call (see _calendar_refresh_loop()).
+    Shared by /calendar and /calendar/wait so both return the exact same
+    shape. Filters are intentionally not baked into the cache -- they're
+    cheap to apply per-request, and caching post-filter would mean a filter
+    change doesn't take effect until the next background refresh.
     """
+    filters = load_filters()
     with _calendar_cache_lock:
         cached = _calendar_cache.get(range)
+        version = _calendar_versions.get(range, 0)
 
     if cached is None:
         # Only possible in the brief window right after a fresh start,
@@ -860,7 +916,32 @@ def get_cached_events(range: str) -> list[dict]:
         # if this persists past a normal startup.
         raise HTTPException(status_code=503, detail="Calendar data isn't loaded yet -- try again shortly")
 
-    return cached["events"]
+    # Forex Factory has no server-side filtering by impact/currency the way
+    # investing.com's importance=/countries= params did -- day/week is the
+    # only thing its own URL controls. Importance/currency selection is
+    # applied here instead, after scraping the full unfiltered response.
+    #
+    # dict(e), not e itself: events comes from the shared cache, not a
+    # fresh parse per request -- apply_column_filter() below mutates each
+    # event dict in place (blanking excluded columns), which used to be
+    # harmless when every request got its own freshly parsed list. Against
+    # the cache, that mutation would corrupt it for every other request
+    # sharing that entry (e.g. one client excluding "actual" permanently
+    # blanking it for everyone else until the next real fetch) -- copying
+    # here keeps the cached originals untouched.
+    events = [
+        dict(e) for e in cached["events"]
+        if e["impact_level"] in filters["importance"] and e["currency"] in filters["currencies"]
+    ]
+    events = apply_column_filter(events, filters["columns"])
+
+    return JSONResponse({
+        "range": range,
+        "version": version,
+        "fetched_at": datetime.utcnow().isoformat(),
+        "count": len(events),
+        "events": events,
+    })
 
 
 # --- API endpoints ---------------------------------------------------------
@@ -887,35 +968,45 @@ def get_calendar(range: str = Query("week", pattern="^(day|week)$")):
     """
     range=day  -> today's events only
     range=week -> this week's events (default)
+
+    Always answers immediately from the cache -- see
+    _build_calendar_response(). For a client that wants to react to
+    changes instead of polling on its own schedule, see /calendar/wait.
     """
-    filters = load_filters()
-    events = get_cached_events(range)
+    return _build_calendar_response(range)
 
-    # Forex Factory has no server-side filtering by impact/currency the way
-    # investing.com's importance=/countries= params did -- day/week is the
-    # only thing its own URL controls. Importance/currency selection is
-    # applied here instead, after scraping the full unfiltered response.
-    #
-    # dict(e), not e itself: events now comes from get_cached_events()'s
-    # shared cache, not a fresh parse per request -- apply_column_filter()
-    # below mutates each event dict in place (blanking excluded columns),
-    # which used to be harmless when every request got its own freshly
-    # parsed list. Against the cache, that mutation would corrupt it for
-    # every other request sharing that entry (e.g. one client excluding
-    # "actual" permanently blanking it for everyone else until the next
-    # real fetch) -- copying here keeps the cached originals untouched.
-    events = [
-        dict(e) for e in events
-        if e["impact_level"] in filters["importance"] and e["currency"] in filters["currencies"]
-    ]
-    events = apply_column_filter(events, filters["columns"])
 
-    return JSONResponse({
-        "range": range,
-        "fetched_at": datetime.utcnow().isoformat(),
-        "count": len(events),
-        "events": events,
-    })
+@app.get("/calendar/wait")
+def wait_for_calendar(
+    range: str = Query("week", pattern="^(day|week)$"),
+    since: int = Query(..., description="The version last received; -1 to skip waiting and get the current data immediately."),
+):
+    """
+    Long-polling variant of /calendar: blocks up to
+    CALENDAR_LONG_POLL_TIMEOUT_S waiting for `range`'s cache version to
+    differ from `since`, then returns the same shape /calendar does. Times
+    out and returns the current (unchanged) data + version if nothing
+    changed in that window -- the caller compares `version` to what it
+    already has and only acts on it when it's different, then immediately
+    calls this again with the new version as `since`. `since=-1` never
+    matches any real version, so it skips the wait and returns immediately
+    -- the same endpoint doubles as "give me the current data now" for a
+    first load or a forced refresh.
+
+    This is what actually gives a client (the ESP32, primarily) push-like
+    behavior without WebSockets or any persistent connection to manage --
+    just the same plain HTTP GET /calendar already is, pointed at an
+    endpoint that doesn't necessarily answer instantly. Reported directly
+    as the goal: the client should be "just the display of the webpage,"
+    reacting to changes instead of deciding on its own schedule when to go
+    looking for them.
+    """
+    with _calendar_cache_cond:
+        _calendar_cache_cond.wait_for(
+            lambda: _calendar_versions.get(range, 0) != since,
+            timeout=CALENDAR_LONG_POLL_TIMEOUT_S,
+        )
+    return _build_calendar_response(range)
 
 
 @app.get("/filters")

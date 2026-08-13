@@ -114,6 +114,8 @@ docker run -d \
 curl http://localhost:8080/health
 curl http://localhost:8080/calendar?range=day
 curl http://localhost:8080/calendar?range=week
+curl "http://localhost:8080/calendar/wait?range=day&since=-1"   # instant -- since=-1 always "changed"
+curl "http://localhost:8080/calendar/wait?range=day&since=1"    # blocks up to CALENDAR_LONG_POLL_TIMEOUT_S
 ```
 
 (Swap `localhost` for the Docker host's actual address if you're testing
@@ -149,6 +151,31 @@ background refresh that fails afterward just logs and keeps serving the
 last good cached copy -- the only client-visible error is a 503 in the
 narrow window right after a fresh start, before the first refresh has
 landed at all.
+
+## Push updates: /calendar/wait
+
+`/calendar` always answers immediately from the cache -- fine for a quick
+check, but a client that wants updates *as they happen*, without deciding
+on its own polling schedule, should use `/calendar/wait?range=day&since=<version>`
+instead. It blocks server-side for up to `CALENDAR_LONG_POLL_TIMEOUT_S`
+(25s) until `range`'s cache version actually differs from `since`, then
+returns the same shape `/calendar` does, plus a `version` field. Pass
+`since=-1` for a first call (or any time you want the current data
+immediately, no waiting) -- calendar_api.py treats that as a version that
+can never match, so it always returns right away. After that, pass back
+whatever `version` you last received to keep waiting for the next real
+change.
+
+This is what the ESP32 firmware actually uses now -- no WebSockets, no
+persistent connection to manage, just the same plain HTTP GET repeated in
+a loop, one request immediately following the last. A change on the
+backend reaches the screen within moments of the background thread
+picking it up, not up to a full poll interval later. A version only
+bumps when the underlying events actually change, not on every
+background refresh cycle -- and not on a filter change either (same
+underlying events, just filtered differently), which is why the ESP32
+always issues an immediate `since=-1` request right after a Settings
+change rather than waiting for its current long-poll to resolve.
 
 ## Updating
 

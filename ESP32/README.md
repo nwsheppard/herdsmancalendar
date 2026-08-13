@@ -2088,6 +2088,62 @@ layer of defense against it.
    scanline/phosphor-fade effect, or a bouncing amber logo, after N minutes
    of no touch input.
 
+## 2026-08: periodic polling replaced with long-polling
+
+Reported directly as the actual goal, after the whole FlareSolverr/
+WiFi-stability saga above: the ESP32 should be "just the display of the
+webpage," not something that decides on its own schedule when to go
+looking for updates. Considered WebSockets for genuine server push, but
+decided against it -- it would mean adding a new client library (nothing
+like it in this project currently) and managing a long-lived connection's
+own lifecycle, exactly the kind of thing that's been fragile all session
+(a persistent connection has more ways to end up in a broken state than a
+short request/response). Long-polling gets the same practical outcome
+with none of that: still a plain `HTTPClient` GET, just pointed at an
+endpoint (`calendar_api.py`'s new `/calendar/wait`) that doesn't
+necessarily answer instantly.
+
+`calendar_client_wait_for_calendar()` (`calendar_client.cpp`, replacing
+`calendar_client_get_calendar()`) calls `/calendar/wait?range=X&since=Y`.
+The server holds the response open until `range`'s data actually changes
+from version `Y`, or its own ~25s timeout elapses -- either way it always
+eventually answers. `since=-1` is a sentinel meaning "don't wait, give me
+whatever's current right now," used for a first load, a tab switch, a
+Settings change, or `alert_manager_tick()`'s post-event refresh -- every
+case that already called `refresh_events()` before. What's new:
+`apply_ready_refresh_result()` now keeps the loop itself alive --
+whenever a result lands that's a genuine success, not superseded by a
+tab switch/Settings change, and not stale, it immediately calls
+`start_refresh(current_calendar_version)` to wait for whatever comes
+*next*, with no periodic timer driving any of it. `calendar_view_poll()`
+(still called every `loop()` iteration) now only handles one thing: a
+short delayed retry after a failed fetch, rather than the periodic
+full-refresh check it used to be -- `poll_interval_ms`/
+`poll_retry_interval_ms`/`last_poll_ms` are gone entirely.
+
+One real tradeoff, accepted deliberately: `calendar_client.cpp`'s
+`http_mutex()` still serializes every HTTP call this project makes (see
+its own git history for why that's necessary), so a tab switch or
+Settings change landing while a long-poll request is genuinely blocked
+server-side has to wait for that request to resolve -- up to
+`calendar_api.py`'s own ~25s timeout, not instant. Considered letting the
+long-poll run on a separate, unsynchronized connection to avoid that, but
+rejected it: that's exactly the kind of concurrent `HTTPClient` access
+already confirmed (earlier in this same investigation) to corrupt
+something at the WiFiClient/lwIP layer badly enough to break every
+request afterward. A bounded worst-case delay on an uncommon interaction
+is a much better trade than reopening that failure mode.
+
+Compiles clean (RAM 35.3%, Flash 70.7% -- unchanged). **Not yet confirmed
+on hardware** -- this replaces a lot of the plumbing built up over the
+rest of this section's investigation, so it's worth specifically
+re-watching for: the screen staying responsive, a real calendar change
+(an actual/forecast value landing) showing up promptly without a manual
+refresh, and whether the earlier idle-gap-shaped flakiness (a request
+right after a long quiet stretch having trouble) still shows up now that
+the connection is essentially never idle for more than a few seconds at a
+time.
+
 ## Known quirks
 
 - `esp32-s3-devkitc-1-myboard.json` is copied from Elecrow's example
