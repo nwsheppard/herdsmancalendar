@@ -1,7 +1,5 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 
 #include "calendar_client.h"
 
@@ -9,41 +7,17 @@ namespace {
 
 String base_url;
 
-// Serializes every HTTP call this project makes (http_get() below, and
-// calendar_client_save_filters()'s own POST) across every caller --
-// background tasks (calendar_view.cpp's refresh_task(), main.cpp's
-// wifi_keepalive_task) and direct calls from the LVGL task alike (Settings
-// screens calling calendar_client_get_currencies()/get_columns() etc
-// synchronously). Confirmed directly on hardware: the periodic calendar
-// refresh (hourly) and the WiFi keep-alive ping (every 5 minutes) have
-// intervals that divide evenly, so they're guaranteed to collide exactly
-// once an hour -- two concurrent HTTPClient calls from two different
-// tasks at the same instant corrupted something shared at the WiFiClient/
-// lwIP layer badly enough that *every* request kept failing for a long
-// stretch afterward, not just the two that collided. HTTPClient/WiFiClient
-// were never designed for concurrent use from multiple tasks; this makes
-// that explicit instead of relying on lucky timing to avoid it. Function-
-// local static, not a namespace-scope global initialized at startup --
-// C++11 guarantees thread-safe one-time initialization for this, and it
-// sidesteps any question of static-initialization-order relative to
-// FreeRTOS's own scheduler startup.
-SemaphoreHandle_t http_mutex()
-{
-    static SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
-    return mutex;
-}
-
-// Default for every endpoint except /calendar/wait (see
-// calendar_client_wait_for_calendar()'s own timeout below) -- these all run
-// entirely on calendar_api.py's own LXC, no upstream round-trip involved,
-// so 8s is already generous.
+// Every endpoint here runs entirely on calendar_api.py's own LXC (its own
+// background thread handles the actual Forex Factory fetch -- see its own
+// module docstring), so 8s is generous for all of them, /calendar
+// included.
 //
 // uint16_t, not a rounder uint32_t: matches HTTPClient::setTimeout()'s own
 // parameter type below (tops out at 65535ms) -- confirmed directly on
 // hardware that a wider type here just moves the overflow trap to whoever
 // calls http_get() with something >65535 instead of catching it at the
-// call site, which is exactly what happened once already (see
-// calendar_client_wait_for_calendar()'s own comment).
+// call site, which is exactly what happened once already (see this
+// project's git history/README for that saga).
 constexpr uint16_t default_timeout_ms = 8000;
 
 /**
@@ -65,11 +39,27 @@ String http_get(const String & path, uint16_t timeout_ms = default_timeout_ms)
         return "";
     }
 
-    xSemaphoreTake(http_mutex(), portMAX_DELAY);
-
     HTTPClient http;
     const String url = base_url + path;
     http.begin(url);
+    // setTimeout() alone was never actually covering the connect phase --
+    // confirmed directly by reading HTTPClient.cpp itself, not guessed.
+    // setTimeout() only sets _tcpTimeout (the *read* timeout, applied via
+    // _client->setTimeout() after a connection already exists) and even
+    // that line is skipped entirely if called before connect() (which
+    // every call here does, right after begin()). The actual connect()
+    // call uses a completely separate _connectTimeout, defaulting to
+    // HTTPCLIENT_DEFAULT_TCP_TIMEOUT (a hardcoded 5000ms) unless
+    // setConnectTimeout() is called explicitly -- which this project never
+    // did, across the entire investigation into intermittent connect
+    // failures. Every single "-1 connection refused" logged throughout
+    // that investigation timed out at ~5000-5033ms -- that hardcoded
+    // default, not anything this project thought it was controlling via
+    // setTimeout()'s timeout_ms argument. Setting both here closes that
+    // gap: the connect phase now gets the same real budget the read phase
+    // does, instead of being silently capped at 5s regardless of what
+    // timeout_ms this function was actually called with.
+    http.setConnectTimeout(timeout_ms);
     http.setTimeout(timeout_ms);
     // HTTPClient's own disconnect() leaves the underlying socket "open for
     // reuse" (doesn't call _client->stop()) once a response's headers have
@@ -98,8 +88,6 @@ String http_get(const String & path, uint16_t timeout_ms = default_timeout_ms)
     Serial.printf("GET %s -> %d (%lu ms, ending t=%lums)\n", url.c_str(), status,
                   static_cast<unsigned long>(elapsed_ms), static_cast<unsigned long>(millis()));
     http.end();
-
-    xSemaphoreGive(http_mutex());
     return body;
 }
 
@@ -193,21 +181,19 @@ bool calendar_client_get_columns(std::vector<StringOption> & out)
     return fetch_string_options("/columns", out);
 }
 
-bool calendar_client_wait_for_calendar(const String & range, int since_version,
-                                       std::vector<CalendarEvent> & out, int & out_version)
+bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out)
 {
-    // /calendar/wait blocks server-side (calendar_api.py's own
-    // CALENDAR_LONG_POLL_TIMEOUT_S) until `range`'s cached data actually
-    // changes from since_version, or that timeout elapses -- either way it
-    // always eventually answers, just not necessarily quickly. This is
-    // what gives push-like behavior without WebSockets or any new client
-    // library: still a plain HTTP GET, just one that doesn't answer
-    // instantly. 30000, not a smaller value: needs to comfortably clear
-    // the server's own wait budget, the same reasoning (and the same
-    // uint16_t-tops-out-at-65535 ceiling on setTimeout()) that already
-    // caused one real bug on the old FlareSolverr-timeout code path -- see
-    // this project's git history/README for that saga.
-    const String body = http_get("/calendar/wait?range=" + range + "&since=" + String(since_version), 30000);
+    // calendar_api.py answers this from its own background-refreshed
+    // cache -- a plain local read, always fast -- so this uses the same
+    // default_timeout_ms every other endpoint here does. (This project
+    // briefly used /calendar/wait, a long-polling variant, instead of
+    // plain polling; reverted -- see calendar_view.cpp's poll_interval_ms
+    // for why. It also briefly used a temporary 60000ms diagnostic
+    // timeout here specifically -- see the README's own writeup -- which
+    // confirmed a stuck read genuinely never got a response even given a
+    // full 60s, not just late; that question answered, reverted back to
+    // the plain default.)
+    const String body = http_get("/calendar?range=" + range);
     if (body.length() == 0) {
         return false;
     }
@@ -226,7 +212,7 @@ bool calendar_client_wait_for_calendar(const String & range, int since_version,
     JsonDocument doc;
     const DeserializationError error = deserializeJson(doc, body);
     if (error) {
-        Serial.printf("Failed to parse /calendar/wait response: %s\n", error.c_str());
+        Serial.printf("Failed to parse /calendar response: %s\n", error.c_str());
         return false;
     }
 
@@ -254,12 +240,11 @@ bool calendar_client_wait_for_calendar(const String & range, int since_version,
         result.push_back(event);
     }
 
-    Serial.printf("Parsed /calendar/wait body: %u events in %lums, ending t=%lums\n",
+    Serial.printf("Parsed /calendar body: %u events in %lums, ending t=%lums\n",
                   static_cast<unsigned>(result.size()),
                   static_cast<unsigned long>(millis() - parse_start_ms), static_cast<unsigned long>(millis()));
 
     out = result;
-    out_version = doc["version"] | since_version;
     return true;
 }
 
@@ -290,12 +275,11 @@ bool calendar_client_save_filters(const CalendarFilters & filters)
     String payload;
     serializeJson(doc, payload);
 
-    xSemaphoreTake(http_mutex(), portMAX_DELAY);
-
     HTTPClient http;
     const String url = base_url + "/filters";
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
+    http.setConnectTimeout(8000); // see http_get()'s own comment on why this is needed alongside setTimeout()
     http.setTimeout(8000);
     http.setReuse(false); // see http_get()'s own comment on this
 
@@ -305,7 +289,5 @@ bool calendar_client_save_filters(const CalendarFilters & filters)
                       http.getString().c_str());
     }
     http.end();
-
-    xSemaphoreGive(http_mutex());
     return status == HTTP_CODE_OK;
 }

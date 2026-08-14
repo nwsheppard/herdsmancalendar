@@ -4,9 +4,6 @@
 #include "wifi_manager.h"
 
 namespace {
-// Shared by wifi_force_reconnect() and wifi_reconnect_if_down() -- see the
-// latter's header comment for why this needs to be one timestamp both
-// paths update, not two independent ones.
 uint32_t last_reconnect_attempt_ms = 0;
 } // namespace
 
@@ -27,22 +24,40 @@ bool wifi_connect(const String & ssid, const String & password, uint32_t timeout
         Serial.print(".");
     }
     Serial.printf("\nWiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
-    return true;
-}
 
-void wifi_force_reconnect()
-{
-    Serial.println("Forcing a full WiFi disconnect/reconnect (repeated fetch failures with no WiFi-disconnect event -- see calendar_view.cpp)");
-    // Plain disconnect(), not disconnect(true) -- the (bool wifioff) form
-    // also powers down the radio, which would need a full WiFi.begin() (SSID
-    // + password) to bring back up, not just reconnect(). A plain
-    // disconnect + reconnect still forces fresh 802.11 association + DHCP,
-    // which is what actually clears stale ARP/connection state -- it just
-    // doesn't power-cycle the radio itself, which isn't needed for this.
-    WiFi.disconnect();
-    delay(100);
-    WiFi.reconnect();
-    last_reconnect_attempt_ms = millis();
+    // Never tried until now, despite months of chasing intermittent
+    // connect()/read timeouts on this exact device: ESP32 Arduino leaves
+    // WiFi modem-sleep power-save mode on by default in station mode,
+    // which is a well-known, common source of exactly this symptom --
+    // the radio periodically dozes and has to wake to actually send/
+    // receive, adding real, sometimes multi-second delays to individual
+    // packets. This terminal is mains-powered sitting next to a display
+    // that's itself never sleeping -- there's no power budget here that
+    // benefits from trading latency for it. Confirmed via CORE_DEBUG_LEVEL
+    // diagnostics that the actual failure signature (NetworkClient.cpp's
+    // own connect() log) was a plain select() timeout waiting for a TCP
+    // handshake to complete on a request to a device on the same LAN, no
+    // DNS involved -- a radio-level delivery symptom, not anything in this
+    // project's own application code, which is exactly modem-sleep's
+    // known failure mode. Confirmed directly that this alone didn't
+    // resolve it, though -- reported directly: a request that succeeds
+    // (connects, gets a response) can be immediately followed by another,
+    // to the same host, from the same task, that fails the identical way
+    // (select() timing out waiting for the handshake). That rules out
+    // anything tied to a task's first use of the network, or to modem-sleep
+    // wake latency specifically -- it's intermittent at the packet level,
+    // not deterministic per-task or per-call.
+    //
+    // Also never tried: forcing maximum TX power. RSSI logged across this
+    // whole investigation has ranged -32 to -53 -- not desperately weak,
+    // but not strong enough to rule out marginal signal margin as a
+    // contributor to intermittent packet loss, especially on a crowded
+    // 2.4GHz band. Arduino-ESP32 doesn't reliably report what the default
+    // actually is across versions/regions, so this sets it explicitly to
+    // the maximum this API exposes rather than assuming the default is
+    // already there.
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    return true;
 }
 
 void wifi_reconnect_if_down(uint32_t reconnect_interval_ms)

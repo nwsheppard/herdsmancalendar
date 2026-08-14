@@ -1,7 +1,4 @@
 #include <Arduino.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
-#include <freertos/task.h>
 #include <vector>
 
 #include "alert_manager.h"
@@ -12,74 +9,47 @@
 #include "fonts.h"
 #include "settings_screen.h"
 #include "theme.h"
-#include "wifi_manager.h"
 
 namespace {
 
-// 2026-08: replaced periodic polling entirely with long-polling --
-// calendar_api.py's /calendar/wait blocks server-side until its cache
-// actually changes, so the ESP32 is a passive display of whatever the
-// backend has rather than the one deciding when to go looking for
-// updates (reported directly as the goal: "I just want the ESP to be the
-// display of the webpage"). refresh_events() (an immediate, since=-1
-// request) starts the loop; every successful, non-superseded result
-// immediately re-requests with since=<the version just received> --see
-// apply_ready_refresh_result() -- so a change on the backend reaches the
-// screen within moments of the background refresh picking it up, not up
-// to a full poll interval later, with no separate periodic timer driving
-// any of it. alert_manager_tick() (alert_manager.cpp) still separately
-// forces an immediate (since=-1) refresh 30-40s after each event's own
-// scheduled time, same as before -- that's a "get me fresh data right
-// now" case, not part of the wait loop.
-//
-// Retrying after a *failed* fetch is the one thing still on a timer:
-// hammering a persistently broken connection in a tight loop wastes
-// retries for no benefit (wifi_force_reconnect(), below, already gives it
-// a real chance to fix itself first) -- see retry_scheduled/
-// calendar_view_poll().
+// 2026-08: this project went through a whole saga chasing Forex Factory's
+// Cloudflare challenge -- calendar_api.py briefly needed up to 65s per
+// fetch (FlareSolverr solving the challenge inline), which pushed a lot of
+// complexity onto this file: a background FreeRTOS task just to keep the
+// screen responsive during that wait, then a long-polling redesign
+// (/calendar/wait) to make the ESP32 reactive instead of polling on a
+// timer. calendar_api.py was restructured so a background thread on the
+// LXC does that whole dance on its own schedule -- /calendar itself is
+// just a fast local cache read now, regardless of how often it's asked.
+// Reported directly, correctly: with that settled, the ESP32 doesn't need
+// to carry any of the complexity that was only ever there to cope with a
+// slow upstream it no longer has to wait on. Back to plain periodic
+// polling -- simpler, and confirmed to also matter for a separate,
+// intermittent connect issue this investigation eventually isolated to
+// the background task itself: calls issued from it were failing to reach
+// the server (confirmed via calendar_api.py's own access log showing zero
+// record of them), while the exact same calls issued directly from this
+// task always succeeded. refresh_events() is synchronous now (see its own
+// comment) for that reason -- the background task is gone entirely, not
+// just polled less often.
+constexpr uint32_t poll_interval_ms = 10 * 60 * 1000;
+
+// Used instead of poll_interval_ms right after a failed refresh -- retrying
+// sooner than the full periodic interval means not leaving "Could not load
+// events" on screen for up to 10 minutes after a transient failure, but
+// still not hammering a persistently broken connection in a tight loop.
 constexpr uint32_t refresh_retry_delay_ms = 30 * 1000;
 bool retry_scheduled = false;
 uint32_t retry_scheduled_at_ms = 0;
 
-// Sticky until the next refresh actually resolves -- read by
-// apply_ready_refresh_result() to decide whether to continue the wait loop
-// (success) or schedule a delayed retry (failure). Starts true so nothing
-// schedules a spurious retry before the very first refresh_events() call
-// (calendar_view_create()'s own initial one) has even run.
+// Both updated by every refresh, periodic or otherwise (a tab switch, a
+// Settings change, alert_manager's post-event refresh) -- so the periodic
+// timer always measures from whatever the *last* refresh attempt actually
+// was, not just from routine periodic ones, and calendar_view_poll() can
+// tell which of poll_interval_ms/refresh_retry_delay_ms applied last time
+// without needing a third variable to track that separately.
+uint32_t last_poll_ms = 0;
 bool last_refresh_ok = true;
-
-// The version last successfully applied for current_range -- passed as
-// `since` on the next wait-loop request (see apply_ready_refresh_result())
-// so calendar_api.py knows what the ESP32 already has and only answers
-// once something past that has actually landed. -1 (calendar_api.py's
-// "always different" sentinel) until the first real response comes back,
-// same value refresh_events() itself always uses to mean "don't wait, give
-// me whatever's current right now."
-int current_calendar_version = -1;
-
-// Confirmed directly on hardware: WiFi.status() can keep reporting
-// WL_CONNECTED while every fetch silently fails (request sent, no response
-// ever arrives), persisting for 25+ minutes across many retries with a
-// perfectly flat free-heap reading (ruling out a leak) until the device
-// was rebooted -- something below WiFi's own connected/disconnected
-// status was stuck (most likely a stale ARP entry), and nothing in
-// loop()'s existing WiFi.reconnect() backstop could ever trigger on it,
-// since that only fires when WiFi itself reports disconnected. This counts
-// consecutive failures across refreshes (reset on any success) and forces
-// a full reconnect via wifi_force_reconnect() once it crosses
-// consecutive_failure_reconnect_threshold, rather than waiting on a manual
-// reboot to clear whatever's actually stuck.
-//
-// Threshold is 1, not a higher number that would wait for a clearer
-// pattern first: confirmed directly on hardware, multiple times now, that
-// a single /calendar read-timeout is already enough to break every
-// request after it (not just repeated failures confirming something's
-// really stuck) -- waiting for more failures first just means several
-// more minutes of guaranteed-doomed retries (each its own up-to-65s
-// blocking wait) before recovery starts, with no benefit, since a single
-// failure already carries the same signal three would.
-int consecutive_refresh_failures = 0;
-constexpr int consecutive_failure_reconnect_threshold = 1;
 
 lv_obj_t * calendar_screen_ref = nullptr;
 lv_obj_t * wifi_icon_label = nullptr;
@@ -106,91 +76,6 @@ String current_range = "day";
 // restore a row that's no longer the countdown target (the row itself only
 // carries its event id, via lv_obj_user_data, not its original time text).
 std::vector<CalendarEvent> current_events;
-
-// calendar_client_wait_for_calendar() (calendar_client.cpp) can legitimately
-// block for up to ~30s at a time by design (calendar_api.py's /calendar/wait
-// holds the response open until something actually changes) -- calling it
-// straight from loop()'s own task, which also runs lv_timer_handler(),
-// would freeze the whole screen (no redraws, no clock, no alerts) for
-// however long that wait takes, confirmed directly on hardware back when
-// /calendar itself could block for a similar reason (Forex Factory's
-// Cloudflare challenge, since eliminated -- see calendar_api.py). The fetch
-// itself runs on a separate FreeRTOS task below (refresh_task()) so
-// loop()/lv_timer_handler() keep running while it's in flight; the result
-// comes back over refresh_result_queue and gets applied to the UI from
-// apply_ready_refresh_result(), which runs on the main/LVGL task like every
-// other UI mutation in this file (LVGL itself isn't thread-safe, so the
-// fetch task only ever touches plain data, never an lv_obj_t).
-QueueHandle_t refresh_result_queue = nullptr;
-bool refresh_in_flight = false;
-// Set when refresh_events() is called again while a fetch is already in
-// flight (e.g. a tab switch landing while a wait-loop request is still out
-// on the wire, or vice versa) -- rather than stacking a second concurrent
-// HTTPClient/task on top of the first (which the shared http_mutex() in
-// calendar_client.cpp would just serialize behind the first anyway, up to
-// its own ~30s timeout), this just remembers to kick a fresh, immediate
-// (since=-1) fetch once the current one lands, however it lands.
-bool pending_refresh_requested = false;
-
-struct RefreshTaskParams {
-    String range;
-    // -1 (calendar_client_wait_for_calendar()'s "don't wait" sentinel) for
-    // an immediate refresh; the last version successfully applied for this
-    // range to continue the wait loop instead. See refresh_events()/
-    // apply_ready_refresh_result().
-    int since_version;
-};
-
-struct RefreshResult {
-    // The range this result was actually fetched for -- current_range may
-    // have changed (a tab switch) while the fetch was still in flight, in
-    // which case this result is stale and should be discarded rather than
-    // applied to the now-wrong tab.
-    String range;
-    bool success = false;
-    bool show_ccy = true;
-    std::vector<CalendarEvent> events;
-    // The cache version this result reflects -- becomes the next request's
-    // since_version, to keep waiting for whatever comes after it. Only
-    // meaningful when success is true.
-    int version = -1;
-};
-
-void refresh_task(void * param)
-{
-    RefreshTaskParams * params = static_cast<RefreshTaskParams *>(param);
-    RefreshResult * result = new RefreshResult();
-    result->range = params->range;
-    const int since_version = params->since_version;
-    delete params;
-
-    // Diagnostics for a still-unexplained failure mode: reported directly
-    // that /calendar and /filters both started failing with read-timeouts
-    // (status -11) every single retry for 11+ minutes straight, with WiFi
-    // never reporting disconnected and the LXC's own access log showing no
-    // record of these requests ever arriving -- and it needed a reboot to
-    // recover, not just time. That combination (works, then every new
-    // connection silently fails, only a reboot clears it) is the classic
-    // signature of a leaked resource on this side, most likely lwIP's own
-    // small fixed socket table or heap fragmentation from repeated
-    // HTTPClient/String churn across retries -- not a server-side or
-    // WiFi-radio problem. Logged unconditionally (not just on failure) so
-    // a steady decline across retries -- rather than a one-off dip -- is
-    // what actually confirms a leak, the same reasoning as this file's own
-    // [stall] logging elsewhere.
-    Serial.printf("[heap] free=%u largest_free_block=%u before refresh_task fetch (since=%d), t=%lums\n",
-                  ESP.getFreeHeap(), ESP.getMaxAllocHeap(), since_version, static_cast<unsigned long>(millis()));
-
-    // Same two calls refresh_events() used to make directly -- just now off
-    // the LVGL task. Neither touches any lv_obj_t, only calendar_client.cpp's
-    // own HTTPClient/ArduinoJson state and this function's local variables.
-    CalendarFilters filters;
-    result->show_ccy = !(calendar_client_get_filters(filters) && filters.currency_codes.size() == 1);
-    result->success = calendar_client_wait_for_calendar(result->range, since_version, result->events, result->version);
-
-    xQueueSend(refresh_result_queue, &result, portMAX_DELAY);
-    vTaskDelete(nullptr);
-}
 
 // One entry per row currently highlighted as an active countdown --
 // several at once whenever multiple events share (or nearly share) a
@@ -719,164 +604,74 @@ void populate_events(const std::vector<CalendarEvent> & events, bool show_ccy)
 }
 
 /**
- * Starts a refresh_task() for current_range with the given since_version --
- * -1 for an immediate "give me whatever's current right now" fetch, or a
- * real version to continue the wait loop. refresh_events() (below) is the
- * public "I want fresh data right now" entry point and always uses -1;
- * apply_ready_refresh_result() calls this directly with a real version to
- * keep the wait loop going after a successful, non-superseded result.
+ * Synchronous, deliberately -- 2026-08, after an extensive investigation
+ * (see the README's own writeup) into intermittent fetch failures that
+ * were eventually isolated to a specific cause: calls made from a
+ * separately-created FreeRTOS task (this used to run on one, to keep the
+ * screen responsive during up-to-65s Cloudflare-challenge-era fetches)
+ * were failing to reach the server -- confirmed via calendar_api.py's own
+ * access log showing zero record of them -- while the exact same calls,
+ * issued directly from this task (the main/LVGL one, same as loop()'s own)
+ * succeeded every single time, consistently, across many captures. Pinning
+ * that background task to the same core this one runs on (ARDUINO_RUNNING_CORE)
+ * didn't fix it either -- confirmed directly, ruling out core affinity as
+ * the deciding factor. Whatever the actual mechanism, "issued from the
+ * original loopTask" is the only configuration this project has ever
+ * directly confirmed reliably works, so that's what this does now, rather
+ * than continuing to debug a background-task design whose entire reason
+ * for existing (surviving a 65s upstream fetch) stopped applying once
+ * calendar_api.py itself was restructured to answer from a fast local
+ * cache. This does mean a fetch briefly freezes the screen (no redraws,
+ * no clock, no alerts) for however long it takes -- consistently under
+ * 150ms in every successful capture so far, and this only runs once per
+ * poll_interval_ms (10 minutes) or on an explicit user/event action, not
+ * continuously, so that's a real but small and infrequent cost, not the
+ * multi-second-to-65s stalls the original background-task design was
+ * built to survive.
  */
-void start_refresh(int since_version)
-{
-    if (refresh_result_queue == nullptr) {
-        // Lazily created rather than at startup: this file has no single
-        // init function that always runs before the first refresh happens
-        // (calendar_view_create() bails out early via
-        // make_no_server_message() when no server's configured yet), so
-        // "first time a refresh actually runs" is the one point that's
-        // guaranteed to precede every use of this queue.
-        refresh_result_queue = xQueueCreate(1, sizeof(RefreshResult *));
-    }
-
-    if (refresh_in_flight) {
-        pending_refresh_requested = true;
-        return;
-    }
-
-    // Only for an immediate request -- a wait-loop continuation (since >= 0)
-    // means the screen already has valid data showing; blanking the status
-    // label for that would flash "Loading events..." over a perfectly good
-    // list on every single ordinary wait-loop cycle, not just when
-    // something's actually being loaded for the first time.
-    if (since_version < 0) {
-        lv_label_set_text(status_label, "Loading events...");
-        timed_timer_handler("refresh_events loading label");
-    }
-
-    refresh_in_flight = true;
-    RefreshTaskParams * params = new RefreshTaskParams{current_range, since_version};
-    // Stack size matches this project's other network+JSON work (plain
-    // HTTPClient GETs + ArduinoJson's heap-backed JsonDocument, no TLS) --
-    // no deep recursion or large local buffers in refresh_task() itself.
-    // Priority 1 matches Arduino's own loopTask, so this fetch doesn't get
-    // starved by anything else the app is doing.
-    //
-    // Originally pinned explicitly to core 0 (loopTask runs on core 1), on
-    // the theory that keeping this off the LVGL task's own core would be
-    // the safest way to guarantee it never blocks lv_timer_handler(). That
-    // backfired on hardware: WiFi/lwIP's own internal tasks also live on
-    // core 0 by default on ESP32 Arduino, and the very first background
-    // fetch after this was flashed failed to even connect (HTTPClient
-    // status -1 on both /filters and /calendar, each after ~5000ms -- a
-    // connect-timeout signature, not a slow response) with no WiFi
-    // disconnect logged around it -- i.e. the radio link was fine, only
-    // this task's own connection attempt wasn't going through. Not pinning
-    // at all (tskNO_AFFINITY) doesn't need core separation from loopTask
-    // to keep the screen responsive anyway: this task spends nearly all
-    // its time blocked in socket recv() waiting on the network, not
-    // burning CPU, so FreeRTOS's own preemption keeps lv_timer_handler()
-    // running regardless of which core either task lands on.
-    xTaskCreatePinnedToCore(refresh_task, "calendar_refresh", 8192, params, 1, nullptr, tskNO_AFFINITY);
-}
-
 void refresh_events()
 {
-    start_refresh(-1);
-}
+    lv_label_set_text(status_label, "Loading events...");
+    timed_timer_handler("refresh_events loading label");
 
-/**
- * Applies whatever refresh_task() last placed on refresh_result_queue, if
- * anything -- called every loop() iteration (via calendar_view_tick()) so a
- * fetch that finishes gets picked up promptly without polling on a timer.
- * Runs on the main/LVGL task, same as every other UI mutation in this file.
- */
-void apply_ready_refresh_result()
-{
-    if (refresh_result_queue == nullptr) {
-        return;
-    }
+    Serial.printf("[heap] free=%u largest_free_block=%u before refresh_events fetch, t=%lums\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap(), static_cast<unsigned long>(millis()));
 
-    RefreshResult * result = nullptr;
-    if (xQueueReceive(refresh_result_queue, &result, 0) != pdTRUE) {
-        return;
-    }
+    CalendarFilters filters;
+    const bool show_ccy = !(calendar_client_get_filters(filters) && filters.currency_codes.size() == 1);
 
-    refresh_in_flight = false;
-    // Read below to decide whether to continue the wait loop (success) or
-    // schedule a delayed retry (failure) -- set from this result's own
-    // success regardless of whether it's about to be discarded as stale
-    // below, since it still reflects whether the fetch itself actually
-    // reached the server just now.
-    last_refresh_ok = result->success;
+    std::vector<CalendarEvent> events;
+    const bool success = calendar_client_get_calendar(current_range, events);
 
-    if (result->success) {
-        consecutive_refresh_failures = 0;
+    if (success) {
+        populate_events(events, show_ccy);
     } else {
-        ++consecutive_refresh_failures;
-        if (consecutive_refresh_failures >= consecutive_failure_reconnect_threshold) {
-            consecutive_refresh_failures = 0;
-            wifi_force_reconnect();
-        }
+        lv_obj_clean(list);
+        lv_label_set_text(status_label, "Could not load events -- check the connection and try again.");
     }
 
-    // current_range may have changed (a tab switch) while this fetch was in
-    // flight -- applying a result fetched for the tab the user has since
-    // navigated away from would flash the wrong data for a moment. Discard
-    // it instead and let the fresh-fetch-on-completion path below (which
-    // pending_refresh_requested's own setter already triggered) replace it.
-    const bool was_stale = result->range != current_range;
-    if (!was_stale) {
-        if (result->success) {
-            populate_events(result->events, result->show_ccy);
-            current_calendar_version = result->version;
-        } else {
-            lv_obj_clean(list);
-            lv_label_set_text(status_label, "Could not load events -- check the connection and try again.");
-        }
+    // Unconditional, including on failure/empty (an empty vector clears any
+    // previously tracked events) -- alert_manager shouldn't keep counting
+    // down to or refreshing for an event that no longer matches current
+    // filters or came from a now-stale fetch. current_events mirrors this
+    // for the same reason: update_next_event_row() needs it to restore a
+    // row's plain time text, and a stale entry there is just as wrong.
+    current_events = events;
+    alert_manager_set_events(events);
 
-        // Unconditional, including on failure/empty (an empty vector clears
-        // any previously tracked events) -- alert_manager shouldn't keep
-        // counting down to or refreshing for an event that no longer
-        // matches current filters or came from a now-stale fetch.
-        // current_events mirrors this for the same reason:
-        // update_next_event_row() needs it to restore a row's plain time
-        // text, and a stale entry there is just as wrong.
-        current_events = result->events;
-        alert_manager_set_events(result->events);
+    // The list was just rebuilt from scratch, so even if the same event(s)
+    // are still tracked as active after this refresh, their border
+    // highlights wouldn't survive on the new row objects -- clear the
+    // tracked set so the next tick re-applies highlights fresh instead of
+    // assuming any from before the rebuild are still there.
+    highlighted_rows.clear();
 
-        // The list was just rebuilt from scratch, so even if the same
-        // event(s) are still tracked as active after this refresh, their
-        // border highlights wouldn't survive on the new row objects --
-        // clear the tracked set so the next tick re-applies highlights
-        // fresh instead of assuming any from before the rebuild are still
-        // there.
-        highlighted_rows.clear();
-    }
-
-    delete result;
-
-    if (was_stale || pending_refresh_requested) {
-        // Something explicitly wants fresh data right now (a tab switch, a
-        // Settings change, alert_manager's post-event refresh) -- always an
-        // immediate (-1) request, for whatever current_range is *now*, not
-        // necessarily the range this result was even for.
-        pending_refresh_requested = false;
-        refresh_events();
-    } else if (last_refresh_ok) {
-        // Nothing else wants an immediate refresh and this one succeeded --
-        // immediately wait for the *next* change instead of sitting idle.
-        // This is what makes the wait loop self-sustaining: once started
-        // (calendar_view_create()'s initial refresh_events() call), it
-        // keeps itself going from here on, with no periodic timer driving
-        // any of it.
-        start_refresh(current_calendar_version);
-    } else {
-        // Failed, and nothing else is waiting on a fresh fetch -- retry
-        // after a short delay rather than immediately (a persistently
-        // broken connection retried in a tight loop wastes retries;
-        // wifi_force_reconnect() above already gave it a real chance to
-        // fix itself before this fires). calendar_view_poll() (called
-        // every loop() iteration) is what actually fires it.
+    last_refresh_ok = success;
+    if (!success) {
+        // Retry sooner than the full poll_interval_ms rather than leaving
+        // "Could not load events" on screen for up to 10 minutes.
+        // calendar_view_poll() (called every loop() iteration) is what
+        // actually fires it.
         retry_scheduled = true;
         retry_scheduled_at_ms = millis();
     }
@@ -1096,7 +891,6 @@ void calendar_view_tick()
     if (list == nullptr) {
         return; // no server configured yet, or "no server" message still showing
     }
-    apply_ready_refresh_result();
     update_next_event_row();
 }
 
@@ -1106,21 +900,29 @@ long calendar_view_get_event_id_at(size_t index)
 }
 
 /**
- * The only thing left on a timer: retrying a failed fetch after
- * refresh_retry_delay_ms (see apply_ready_refresh_result()). Everything
- * else -- the initial load, every ordinary update -- flows from the
- * self-sustaining wait loop that function drives directly; there's no
- * periodic "check if it's time to refresh" logic anymore, since
- * calendar_api.py's /calendar/wait is what decides when there's actually
- * something new, not a timer here guessing at an interval.
+ * Rate-limits *checking* -- including the no-server-configured case where
+ * refresh_events() never actually runs -- otherwise that case would
+ * re-check calendar_server_url_load() on every single loop() iteration
+ * once past the first interval, forever, instead of once per interval
+ * like everything else. A retry_scheduled retry always takes priority
+ * over (and effectively resets the clock on) the ordinary periodic
+ * check -- see last_poll_ms's own comment for why both get updated by
+ * every refresh, not just periodic ones.
  */
 void calendar_view_poll()
 {
-    if (!retry_scheduled) {
+    if (retry_scheduled) {
+        if (millis() - retry_scheduled_at_ms >= refresh_retry_delay_ms) {
+            retry_scheduled = false;
+            last_poll_ms = millis();
+            calendar_view_refresh();
+        }
         return;
     }
-    if (millis() - retry_scheduled_at_ms >= refresh_retry_delay_ms) {
-        retry_scheduled = false;
-        refresh_events();
+
+    const uint32_t now = millis();
+    if (now - last_poll_ms >= poll_interval_ms) {
+        last_poll_ms = now;
+        calendar_view_refresh();
     }
 }

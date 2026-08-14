@@ -41,14 +41,16 @@ plain dict lookup. Any client can now poll as often as it likes without
 ever paying FlareSolverr's latency itself. That schedule isn't a single
 fixed interval (2026-08, refined further): CALENDAR_REFRESH_INTERVAL_LONG_S
 (3h) is the steady-state cadence, switching to the much shorter
-CALENDAR_REFRESH_INTERVAL_SHORT_S (5min) whenever a cached event is within
+CALENDAR_REFRESH_INTERVAL_SHORT_S (1min) whenever a cached event is within
 CALENDAR_EVENT_PROXIMITY_WINDOW_S of right now -- reported directly that a
 flat 5-minute cadence was more load against Forex Factory than the data
 (which only actually changes around events' own scheduled times)
 justifies, but a long fixed interval alone would've silently broken the
 ESP32's own alert_manager_tick() post-event refresh (alert_manager.cpp),
 which only finds anything new if this cache happened to have refreshed
-recently enough to have it. See _build_calendar_response()/
+recently enough to have it -- confirmed directly on hardware that even
+the original 5-minute short cadence wasn't tight enough for that, tightened
+to 1 minute. See _build_calendar_response()/
 _refresh_calendar_cache()/_calendar_needs_short_cadence() for the
 mechanics, and lifespan() for the one-time synchronous initial fetch at
 startup.
@@ -252,13 +254,24 @@ SESSION_PATH = FILTERS_DIR / "ff_session.json"
 # include one within CALENDAR_EVENT_PROXIMITY_WINDOW_S of right now (see
 # _calendar_needs_short_cadence()). This isn't just about politeness to
 # Forex Factory -- the ESP32's own alert_manager_tick() already refreshes
-# 30-40s after each event's scheduled time specifically to pick up
-# actual/forecast values as they land (alert_manager.cpp), and that only
-# actually finds anything new if this cache has itself refreshed recently
-# enough to have it -- a 3-hour blind spot around the exact moments that
-# matter most would silently break that entirely.
+# a few times over the minutes after each event's scheduled time
+# specifically to pick up actual/forecast values as they land
+# (alert_manager.cpp), and that only actually finds anything new if this
+# cache has itself refreshed recently enough to have it.
+#
+# 1 minute, not the original 5 -- reported directly, confirmed on
+# hardware: an event's actual value hadn't landed on the ESP32's screen
+# even after its own multiple post-event refresh attempts, because this
+# cache's own refresh (on this separate clock, not synchronized to any
+# specific event's exact time) hadn't picked up the new value yet by any
+# of those attempts. 5 minutes between refreshes near an event was too
+# coarse a grain for that gap to reliably close in time -- 1 minute is a
+# tighter match to the ESP32's own checkpoint spacing (30s/90s/210s/390s
+# after an event), at the cost of up to 5x more FlareSolverr/Forex
+# Factory load during the (narrow, event-proximity-only) window this
+# cadence applies in at all.
 CALENDAR_REFRESH_INTERVAL_LONG_S = 3 * 60 * 60
-CALENDAR_REFRESH_INTERVAL_SHORT_S = 5 * 60
+CALENDAR_REFRESH_INTERVAL_SHORT_S = 60
 # How far before/after an event's scheduled time counts as "coming up" --
 # starts the short cadence early enough to already be refreshing frequently
 # going into the release, and keeps it up afterward long enough to catch a
@@ -865,21 +878,34 @@ def _calendar_refresh_loop() -> None:
     Waits before each refresh, not after -- lifespan() already did the
     first fetch for both ranges before this thread was even started;
     refreshing again immediately here would just repeat that same round
-    trip a second time for no reason. Event.wait() as the loop condition
-    (rather than wait() as a plain statement inside the loop) is what makes
-    "wait first" and "stop promptly on shutdown" both fall out naturally:
-    it returns True the moment the stop Event is set, so a shutdown
-    mid-wait exits the loop immediately instead of sleeping out the full
-    interval first.
+    trip a second time for no reason.
 
-    The wait itself is CALENDAR_REFRESH_INTERVAL_SHORT_S or _LONG_S,
-    decided fresh each time from whatever's currently cached (i.e. as of
-    the *previous* refresh, not this upcoming one -- see
-    _calendar_needs_short_cadence()'s own comment for why that's fine: an
-    event just outside the window on this check will be well inside it by
-    the next one either way, since the short cadence is much shorter than
-    the proximity window itself).
+    A real bug lived here (2026-08, reported directly and confirmed: an
+    event's actual value never landed in this cache at all, not even
+    hours later): the interval (SHORT_S or LONG_S) used to be decided
+    once, then slept through in a single Event.wait(interval) call before
+    checking anything again. That's fine once already oscillating within
+    the short cadence -- an event just outside the proximity window on one
+    check really will be well inside it by the next, since the short
+    cadence is much shorter than the window. It quietly breaks for the
+    very first long-to-short transition, which is almost every event: if
+    the decided interval is the 3-hour LONG_S, the loop sleeps the *entire*
+    3 hours before checking anything again -- during which an event can
+    enter *and exit* the 30-minute proximity window with nobody ever
+    noticing, because nothing re-evaluates until that sleep ends. For an
+    event roughly 3 hours after the previous refresh (unremarkable, not an
+    edge case), the short cadence could go the entire relevant window
+    without ever actually engaging.
+
+    Fixed by never sleeping longer than CALENDAR_REFRESH_INTERVAL_SHORT_S
+    at a stretch, regardless of which interval is actually in effect --
+    the loop wakes up at least that often to cheaply re-evaluate (an
+    in-memory timestamp/event scan, no network call) whether the real
+    target interval has now elapsed, only doing an actual refresh once it
+    has. This is what makes a long-to-short transition get noticed within
+    about a minute of it happening, not missed for up to 3 hours.
     """
+    last_refresh_at = time.monotonic()
     while True:
         now = datetime.now(CALENDAR_TIMEZONE)
         interval = (
@@ -887,10 +913,15 @@ def _calendar_refresh_loop() -> None:
             if _calendar_needs_short_cadence(now)
             else CALENDAR_REFRESH_INTERVAL_LONG_S
         )
-        if _calendar_refresh_stop.wait(interval):
+        remaining = interval - (time.monotonic() - last_refresh_at)
+        if remaining <= 0:
+            for range in ("day", "week"):
+                _refresh_calendar_cache(range)
+            last_refresh_at = time.monotonic()
+            continue
+
+        if _calendar_refresh_stop.wait(min(remaining, CALENDAR_REFRESH_INTERVAL_SHORT_S)):
             return
-        for range in ("day", "week"):
-            _refresh_calendar_cache(range)
 
 
 def _build_calendar_response(range: str) -> JSONResponse:

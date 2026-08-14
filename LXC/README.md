@@ -125,15 +125,37 @@ FlareSolverr round trip or waits on one.
 
 That schedule isn't a single fixed interval: `CALENDAR_REFRESH_INTERVAL_LONG_S`
 (3 hours) is the steady-state cadence, switching to the much shorter
-`CALENDAR_REFRESH_INTERVAL_SHORT_S` (5 minutes) whenever a cached event's
+`CALENDAR_REFRESH_INTERVAL_SHORT_S` (1 minute) whenever a cached event's
 scheduled time is within `CALENDAR_EVENT_PROXIMITY_WINDOW_S` (30 minutes)
-of right now. A flat 5-minute cadence around the clock turned out to be
-more load against Forex Factory than the data justifies -- events only
-actually change (actual/forecast values landing, revisions) around their
-own scheduled times, not continuously -- but a long fixed interval alone
+of right now. A flat cadence around the clock turned out to be more load
+against Forex Factory than the data justifies -- events only actually
+change (actual/forecast values landing, revisions) around their own
+scheduled times, not continuously -- but a long fixed interval alone
 would've silently broken the ESP32's own `alert_manager_tick()`
 post-event refresh (`alert_manager.cpp`), which only finds anything new
 if this cache happened to have refreshed recently enough to have it.
+
+**A real bug lived in how that switch got decided, not just how tight it
+was.** Reported directly and confirmed: an event's actual value never
+landed in this cache at all, even hours later -- not an ESP32-side
+symptom. The refresh loop used to decide the interval once, then sleep
+through the *entire* thing in one `Event.wait(interval)` call before
+checking anything again. That's fine once already inside the short
+cadence, but it silently broke the very first long-to-short transition,
+which is almost every event: if the decided interval was the 3-hour long
+cadence, the loop slept the *entire* 3 hours before re-evaluating --
+during which an event could enter and exit the 30-minute proximity
+window with nobody ever noticing, since nothing woke up to check. Fixed
+(`_calendar_refresh_loop()`) so the loop never sleeps longer than
+`CALENDAR_REFRESH_INTERVAL_SHORT_S` at a stretch regardless of which
+interval is actually in effect -- it wakes up at least that often to
+cheaply re-evaluate (an in-memory check, no network call) whether the
+real target interval has elapsed yet, so a long-to-short transition gets
+noticed within about a minute of happening, not missed for up to 3 hours.
+Verified directly against the actual scheduling logic (not just read
+through): a simulated cadence transition mid-sleep now triggers a refresh
+right when the transition happens, not at the end of the original long
+interval.
 
 This wasn't always true, and mattered a lot in practice: it used to fetch
 inline, on whichever request happened to arrive after a short-lived cache

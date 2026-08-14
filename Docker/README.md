@@ -132,14 +132,26 @@ triggers a FlareSolverr round trip or waits on one.
 
 That schedule isn't a single fixed interval: `CALENDAR_REFRESH_INTERVAL_LONG_S`
 (3 hours) is the steady-state cadence, switching to the much shorter
-`CALENDAR_REFRESH_INTERVAL_SHORT_S` (5 minutes) whenever a cached event's
+`CALENDAR_REFRESH_INTERVAL_SHORT_S` (1 minute) whenever a cached event's
 scheduled time is within `CALENDAR_EVENT_PROXIMITY_WINDOW_S` (30 minutes)
-of right now -- a flat 5-minute cadence around the clock was more load
-against Forex Factory than the data (which only actually changes around
-events' own scheduled times) justifies, but a long fixed interval alone
-would've silently broken the ESP32's own post-event refresh
+of right now -- a flat cadence around the clock was more load against
+Forex Factory than the data (which only actually changes around events'
+own scheduled times) justifies, but a long fixed interval alone would've
+silently broken the ESP32's own post-event refresh
 (`alert_manager_tick()`, `alert_manager.cpp`), which only finds anything
 new if this cache happened to have refreshed recently enough to have it.
+
+A real bug lived in how that switch got decided, not just how tight it
+was: the refresh loop used to sleep through an *entire* decided interval
+in one blocking wait before checking anything again, which silently broke
+the first long-to-short transition for almost every event -- a 3-hour
+sleep meant an event could enter and exit its 30-minute proximity window
+with nobody ever noticing. Fixed so the loop never sleeps longer than
+`CALENDAR_REFRESH_INTERVAL_SHORT_S` at a stretch regardless of which
+interval is in effect, catching that transition within about a minute
+instead of missing it for up to 3 hours. See `LXC/README.md`'s own
+writeup for the full story -- reported directly from a real event whose
+actual value never landed in this cache at all.
 
 One consequence: `docker compose up`/`docker run` won't report the
 container healthy until the first fetch completes (up to ~65s x2 in the

@@ -2144,6 +2144,513 @@ right after a long quiet stretch having trouble) still shows up now that
 the connection is essentially never idle for more than a few seconds at a
 time.
 
+**Follow-up, confirmed on hardware: a real reconnect-storm bug, plus one
+more source of the idle-gap-shaped flakiness removed.** The idle-gap
+pattern was still there -- `/filters`, the first call of a brand-new
+background task, timed out at boot moments after `/health` (called from
+the main/boot task, not a new one) succeeded fine. That's the fourth time
+in this investigation the failure has specifically landed on a fresh
+task's first call; still unresolved (see below).
+
+But the log also showed something new and concrete: `wifi_force_reconnect()`
+fired three times inside 85 seconds, with `errno 118` ("Host is
+unreachable") appearing right after -- an explicit, immediate error from
+the network stack, not a silent timeout. Root cause: `wifi_force_reconnect()`
+had no cooldown of its own, and `calendar_view.cpp`'s threshold for
+calling it is deliberately 1 (a single failure already proved reliable
+enough as a signal -- see that constant's own comment). A fresh
+disconnect/reconnect needs real time to actually settle (new DHCP lease,
+ARP re-establishment) before it's meaningful to judge whether it worked;
+firing another one before that happens just interrupts the previous
+attempt mid-flight, which plausibly explains "host unreachable" showing
+up immediately after -- no route existed yet because the *previous*
+reconnect never got to finish. Added a 20s cooldown
+(`wifi_force_reconnect_cooldown_ms`, `wifi_manager.cpp`) -- a repeat call
+inside that window is now a logged no-op instead of another disruptive
+disconnect.
+
+Separately, reported directly and fixed the same session: `refresh_task()`
+was refetching `/filters` on *every* cycle, including every ordinary
+wait-loop continuation (roughly every `CALENDAR_LONG_POLL_TIMEOUT_S`,
+forever) -- for a value that only ever changes via Settings, a
+user-initiated action. Filters are now cached (`cached_filters`,
+persisting across `refresh_task()` invocations, each a brand-new task) and
+only refetched when `since_version < 0` -- an immediate/explicit request
+(tab switch, Settings closing, initial load, event-time refresh), not a
+wait-loop cycle. Halves the HTTP call volume of the steady-state loop as
+a side effect, which also means fewer chances to hit whatever's still
+causing the fresh-task first-call flakiness, even though it doesn't
+address that pattern directly.
+
+Compiles clean (RAM 35.3%, Flash 70.7%). **Not yet confirmed on
+hardware.** The persistent-task theory for the remaining idle-gap pattern
+(one long-lived task instead of a new one per fetch, in case ESP-IDF's
+networking stack has a one-time per-task initialization cost or race)
+is still on the table, pending confirmation this round of fixes doesn't
+already resolve enough of it in practice.
+
+**Follow-up: a genuinely new candidate for the boot-time first-call
+failure, not another patch to the symptom.** Reported directly that the
+fixes above weren't actually resolving anything -- fair, since every one
+of them addressed something *downstream* of the actual failure rather
+than the failure itself, which kept recurring at boot regardless: the
+first `/filters` call, from the first `refresh_task()`, timing out or
+failing to connect, every single time, while `/health` (called directly
+from `setup()`'s own task, not a spawned one) always succeeded fine
+moments earlier.
+
+Found a real, previously-unconsidered candidate by re-reading `setup()`'s
+own sequence: `configTzTime(...)` was called right after WiFi connects,
+*before* `calendar_view_create()`. It's non-blocking -- it kicks off
+ESP-IDF's SNTP client as its own background activity, including actual
+DNS resolution for `pool.ntp.org`/`time.nist.gov`, unlike every request
+this project makes itself (all plain local-IP requests, no DNS
+involved). `calendar_view_create()` immediately kicks off the very first
+`refresh_task()` right after that -- meaning SNTP's first background sync
+attempt (DNS lookup + outbound UDP to the internet) and the first
+calendar fetch's connection attempt (to a plain local IP) were starting
+within moments of each other, every single boot. That's a genuinely
+plausible source of network-stack contention specific to boot and
+specific to a freshly-started task's first network call -- matching
+everything observed across every prior theory in this section, none of
+which actually explained *why* it was always specifically the first call
+after boot.
+
+Moved `configTzTime(...)` to after `calendar_view_create()`/
+`apply_pending_wifi_icon_state()`, with an explicit 3s `delay()` first --
+gives the first calendar fetch's connection attempt a head start before
+NTP's own background network activity begins, instead of both starting
+at the same moment. `alert_manager.cpp`'s `getLocalTime()` calls only
+ever run from `loop()` (well after `setup()` finishes) and already treat
+sync-not-done-yet as "nothing to do," so nothing depends on NTP starting
+any earlier than this. Compiles clean (RAM 35.3%, Flash 70.7%). **Not
+yet confirmed on hardware** -- this is a real, mechanism-backed
+hypothesis (not another guess-and-patch), but still needs a clean boot
+capture to confirm the first fetch actually goes through now.
+
+**Follow-up: disproven by the very next capture, cleanly.** The math
+doesn't work -- `configTzTime()` couldn't fire until roughly t=7048ms
+(after `calendar_view_create()` returns + the 3s `delay()`), but the
+first `/filters` call had already started failing at t=4048ms, well
+before NTP's DNS lookup could have even begun. Ruled out with confidence,
+not just unconfirmed.
+
+**Also raised directly, and worth taking seriously: `wifi_force_reconnect()`
+never actually recovers this, and that's a real structural gap, not
+just bad luck.** It only resets the 802.11 association layer (fresh
+DHCP lease, cleared ARP) -- it does nothing to lwIP itself. Sockets, the
+DNS resolver's internal state, any stuck connection bookkeeping all live
+above the WiFi association layer and survive a WiFi-level reconnect
+untouched. The only thing that's ever cleared this across the whole
+investigation is a full reboot, which reinitializes lwIP from scratch --
+consistent with the bug living somewhere a WiFi reconnect structurally
+cannot reach, not with "the fix just hasn't been aggressive enough yet."
+
+At this point every specific hypothesis tried (core pinning, connection
+reuse, the HTTP mutex, ARP staleness, idle timeouts, a resource leak, a
+reconnect storm, NTP/DNS contention) has either fixed something real but
+separate, or been cleanly disproven -- none confirmed by an actual
+underlying reason, only by HTTPClient's own coarse status codes (-11/-1).
+The one time a real reason surfaced (`errno 118`, "Host is unreachable")
+was luck: it happened to log at ESP-IDF's default ERROR level. Rather
+than guess again, added `-D CORE_DEBUG_LEVEL=4` to `platformio.ini` --
+diagnostic only, no logic change. This should surface
+`WiFiClient`/`NetworkClient`'s own internal connect-lifecycle
+`log_d()`/`log_v()` tracing (compiled out entirely at the default level)
+on every attempt, giving the real errno/failure reason for the next
+capture instead of another coarse status code to speculate about.
+Compiles clean (RAM 35.3%, Flash 71.2% -- the framework itself pulls in
+more debug string literals at this level). **Not yet confirmed on
+hardware** -- waiting on a fresh capture with this logging in place.
+
+**Follow-up: the logging worked, and surfaced two real findings at
+once.** `NetworkClient.cpp`'s own `connect()` logging showed the actual
+underlying reason for the first time: `select returned due to timeout
+5000 ms for fd 48` -- a plain TCP handshake that never completed, for a
+request to another device on the same LAN with no DNS involved. That's a
+radio/packet-delivery-level symptom, below anything this project's
+application code (the mutex, task design, caching, any of it) could ever
+influence -- explaining why so many application-level fixes kept not
+resolving it.
+
+The same capture also caught a real, self-inflicted confound:
+`CORE_DEBUG_LEVEL=4` auto-enables Arduino-ESP32's own "After Setup"
+heap/GPIO diagnostic dump (`core/chip-debug-report.cpp`, gated on
+`ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_DEBUG`) -- printed synchronously
+on `loopTask` immediately after `setup()` returns, which is also exactly
+when the very first background calendar fetch is starting. Blocking
+Serial output competing with the exact connection attempt being
+diagnosed isn't a clean read. Dropped to `CORE_DEBUG_LEVEL=3` (Info) --
+the specific line that mattered logs at Info, so this keeps it (along
+with WARN/ERROR detail) while dropping both the heap dump and
+`HTTPClient.cpp`'s noisier per-call DEBUG chatter.
+
+For the actual radio-level symptom: added `WiFi.setSleep(false)`
+(`wifi_manager.cpp`, right after a successful connect) -- never tried
+across this entire investigation, despite being a well-known, common
+cause of exactly this failure signature. ESP32 Arduino leaves WiFi
+modem-sleep power-save mode on by default in station mode; the radio
+periodically dozes and has to wake to actually send/receive, which can
+add real, sometimes multi-second delays to individual packets -- matching
+the observed symptom precisely. This terminal is mains-powered next to a
+display that never sleeps either; there's no power budget here that
+benefits from trading latency for it. Compiles clean (RAM 35.3%, Flash
+70.9%). **Not yet confirmed on hardware** -- this is the first fix in the
+whole investigation aimed at the actual confirmed failure layer (radio
+packet delivery) rather than a layer above it.
+
+**Follow-up: `WiFi.setSleep(false)` didn't fix it either -- `/health`
+failed for the first time in this entire investigation, the one call
+that had never once failed before.** Reported directly, and correctly:
+`wifi_force_reconnect()` was removed entirely (`wifi_manager.cpp`/`.h`,
+`calendar_view.cpp`) rather than tuned again. It only ever reset 802.11
+association + got a fresh DHCP lease -- confirmed, repeatedly, across
+this whole investigation, that doing so never actually restored a
+working connection. A WiFi-level reconnect structurally cannot fix
+anything living below that layer, which is where the real symptom (a
+plain TCP `connect()` timing out waiting for a handshake) was confirmed
+to actually be -- so calling it was never going to help, and interrupting
+an association mid-recovery to do it was a plausible way to actively make
+things worse (see the reconnect-storm entry above). `consecutive_refresh_failures`/
+`consecutive_failure_reconnect_threshold`, which existed solely to decide
+when to call it, were removed too rather than left as dead state.
+`calendar_view.cpp`'s own failed-fetch handling is unchanged otherwise --
+a short delayed retry (`retry_scheduled`), same as before, just without
+the WiFi-layer action attached to it. Compiles clean (RAM 35.3%, Flash
+70.9%).
+
+Still open: the actual root cause (confirmed to be a radio/packet-delivery-
+level `connect()` timeout, not anything in this project's own code) is not
+yet fixed. `WiFi.setSleep(false)` was the first attempt aimed at that
+correct layer and didn't resolve it on its own -- worth continuing to dig
+at that layer specifically (RSSI/channel conditions, router-side logs
+during a failure window, whether the AP itself is dropping/delaying this
+specific device) rather than the application layer, which has now been
+thoroughly ruled out across this entire section.
+
+**Follow-up: `WiFi.setSleep(false)` ruled out one more thing on the next
+capture -- confirmed the failure isn't tied to a task's first use of the
+network, or to modem-sleep wake latency specifically.** `/filters`
+succeeded (42ms), and moments later `/calendar/wait` -- same task, same
+host, no new connection context -- failed the identical way (`select()`
+timing out waiting for a handshake). A connection to that exact host had
+just worked seconds earlier. That's intermittent packet-level loss, not
+anything deterministic about which call, which task, or which endpoint.
+
+RSSI logged across this whole investigation has ranged -32 to -53 -- not
+desperately weak, but not strong enough to rule out marginal signal
+margin as a contributor on a crowded 2.4GHz band. Added
+`WiFi.setTxPower(WIFI_POWER_19_5dBm)` (`wifi_manager.cpp`, right after
+`setSleep`) -- forces maximum TX power explicitly rather than assuming
+whatever Arduino-ESP32's default happens to be across versions/regions.
+Compiles clean (RAM 35.3%, Flash 70.9%). **Not yet confirmed on
+hardware.**
+
+If this doesn't resolve it either, the remaining plausible causes are
+outside this project's own code entirely -- worth checking directly
+rather than continuing to guess at firmware-side levers: whether the
+router/AP exposes per-client signal/retry/packet-loss stats for this
+device's MAC address, and whether a *different* device on the same LAN
+also has trouble reaching 192.168.68.10 specifically (which would point
+at the LXC/Proxmox host's own network stack rather than the ESP32's
+radio).
+
+**Follow-up: router-side diagnostics came back clean (no errors, no
+packet loss for this device) and other clients reach the LXC fine --
+ruling out RF/AP-side causes with real evidence, not assumption. That
+redirected the investigation back to this project's own code, and reading
+the vendored `HTTPClient.cpp` directly (not guessing) found a real,
+confirmed bug in how this project was using its own API.**
+
+`HTTPClient::setTimeout(uint16_t timeout)` -- the *only* timeout call this
+project has ever made -- sets `_tcpTimeout` (the **read** timeout,
+applied via `_client->setTimeout()`) and, critically, that line is
+skipped entirely unless a connection is already active when it's called.
+Every call in this project calls it immediately after `begin()`, before
+any `connect()` has happened -- so it never took effect at all for the
+connect phase. The actual TCP `connect()` call uses a completely separate
+`_connectTimeout`, which only `setConnectTimeout()` (never called,
+anywhere in this project, until now) controls -- left at its hardcoded
+default, `HTTPCLIENT_DEFAULT_TCP_TIMEOUT` = **5000ms**. Every single `-1
+connection refused` failure logged across this entire investigation timed
+out at ~5000-5033ms -- that hardcoded default, not anything this project
+believed it was controlling via whatever `timeout_ms` `http_get()` was
+actually called with (8000/30000/65000 at various points). Every timeout
+fix made earlier in this investigation was real and not wasted (they
+correctly fixed the *read* phase, and the `uint16_t` overflow bug was a
+real bug), but none of them ever touched the connect phase at all, which
+explains why `-1` failures kept recurring at the same ~5s mark no matter
+what those fixes changed.
+
+Fixed by calling `http.setConnectTimeout(timeout_ms)` alongside
+`http.setTimeout(timeout_ms)` in both `http_get()` and
+`calendar_client_save_filters()`'s POST (`calendar_client.cpp`) -- the
+connect phase now gets the same real budget the read phase does, instead
+of being silently capped at 5s regardless of what this project thought it
+had configured. Compiles clean (RAM 35.3%, Flash 70.9%). **Not yet
+confirmed on hardware**, but this is the strongest lead in the whole
+investigation: a specific, readable, confirmed bug in this project's own
+code (not a downstream symptom, not an environmental factor), matching
+the single most common failure signature seen throughout every capture in
+this section.
+
+**Follow-up: confirmed the connect-timeout fix alone isn't the whole
+story -- the next capture still failed, now as a read-timeout (8056ms)
+rather than the connect-timeout signature.** Getting past the handshake
+but still stalling on the response is a different (if related) symptom,
+consistent with something beyond just the 5s connect cap.
+
+Raised directly: why didn't this surface before this whole
+FlareSolverr/Cloudflare-driven investigation, if the `setConnectTimeout()`
+bug has likely always been in the code? Best explanation, not a
+certainty: request *frequency*, not anything about the bug itself,
+changed. The old model opened a new connection roughly once an hour, then
+once every 10 minutes; the long-polling design that came out of this same
+investigation opened one roughly every `CALENDAR_LONG_POLL_TIMEOUT_S`
+(~25s), continuously -- a 25-150x increase in how often this project ever
+attempted a connection. A rare, previously-almost-never-hit timing issue
+at that low a frequency would simply not have been noticed; at that much
+higher a frequency, it becomes the dominant, constantly-visible symptom.
+That doesn't require anything about the network to have gotten worse,
+just that something rare got asked about vastly more often.
+
+Two changes made together on this reasoning:
+
+1. **Reverted from continuous long-polling back to periodic polling**
+   (`poll_interval_ms`, 10 minutes, `calendar_view_poll()`) --
+   `calendar_client_wait_for_calendar()`/`/calendar/wait` are unchanged
+   and still used (still no reason to give that up -- it's a fast local
+   cache read either way), but `refresh_events()` always requests
+   `since=-1` now, and nothing auto-continues into a wait loop after a
+   successful result the way it briefly did. This alone cuts connection
+   attempts back down by the same 25-150x, directly reducing exposure to
+   whatever the remaining issue is regardless of whether it's ever fully
+   root-caused. `apply_ready_refresh_result()`'s failure handling is
+   unchanged (`retry_scheduled`, 30s backoff) -- only the "it succeeded,
+   what now" path changed, from "immediately wait for the next change" to
+   "nothing, until the periodic timer fires."
+2. **A direct, isolated boot-delay test**: `main.cpp`'s delay before the
+   very first `calendar_view_create()` (and so the first background
+   fetch) raised from 1500ms to 5000ms, specifically to test whether more
+   boot settling time changes the outcome of that first fetch, independent
+   of both `CORE_DEBUG_LEVEL` (confirmed to stay at 3 for this test --
+   the "After Setup" heap/GPIO dump is compiled out entirely below level
+   4, verified directly by reading `main.cpp`'s own `#if
+   ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_DEBUG` gate, so it isn't a
+   factor here regardless) and the already-ruled-out NTP-timing theory
+   (`configTzTime()` already fires after this point, unchanged from its
+   own earlier fix).
+
+Compiles clean (RAM 35.3%, Flash 70.9%). **Not yet confirmed on
+hardware.** Plan is to test this (periodic polling + longer boot delay,
+`CORE_DEBUG_LEVEL=3`) first, then flip back to `CORE_DEBUG_LEVEL=4` for
+another verbose capture if failures still occur, now with a much lower
+attempt frequency making any remaining capture easier to correlate
+against.
+
+**Follow-up: clarified and acted on separately -- reverting *polling
+frequency* (above) wasn't the same ask as reverting the ESP32's own
+*code*.** The long-polling redesign left real complexity behind in
+`calendar_view.cpp`/`calendar_client.cpp` even after switching back to a
+periodic timer: `since`/`version` threaded through `RefreshTaskParams`,
+`RefreshResult`, `calendar_client_wait_for_calendar()`, and a
+`cached_filters` mechanism keyed on "is this an immediate request" -- all
+of it built to make continuous long-polling behave well, all of it dead
+weight once nothing calls it continuously anymore. Removed:
+`calendar_client_wait_for_calendar()` reverted to a plain
+`calendar_client_get_calendar()` calling `/calendar` (not `/calendar/wait`
+-- calendar_api.py still exposes both; this project just doesn't need the
+long-polling one anymore), `RefreshTaskParams` collapsed back to a plain
+range string (matching the pre-long-polling shape), `RefreshResult` lost
+its `version` field, and `cached_filters` is gone -- `refresh_task()`
+fetches filters fresh every call again, cheap enough at a 10-minute
+cadence that the caching complexity wasn't worth keeping.
+
+Deliberately kept: the background-task/queue/mutex design itself. That's
+not Cloudflare-era baggage -- it protects against a single slow fetch
+freezing the screen regardless of *why* it's slow, which is still a live,
+unresolved concern in this same investigation. Removing it would trade a
+real, still-relevant safety net for a return to the original
+freezing-screen bug this whole file was rewritten to fix.
+
+Compiles clean (RAM 35.3%, Flash 70.9%, and genuinely smaller in absolute
+bytes than the long-polling version). **Not yet confirmed on hardware**,
+but this one doesn't need to be -- it's a straightforward code
+simplification with the exact same request pattern as the periodic-polling
+revert above, not a new behavior to validate.
+
+**Follow-up, with `CORE_DEBUG_LEVEL=4` back on: the connect-timeout fix is
+confirmed working (`connect()` now succeeds in ~20-30ms every time, no
+more "select timeout" connect failures), but every single request in this
+capture still failed -- now hitting a *read* timeout at the full 8s
+default instead.** One thing this capture rules out on its own: the
+"After Setup" heap/GPIO dump only prints once, right after `setup()`
+returns (~t=8.5s here) -- but failures kept recurring at t=24717,
+t=62904, and beyond, tens of seconds after that one-time dump had already
+finished. It cannot be causing failures that happen long after it's done
+printing -- that theory is now closed for good, not just suspected.
+
+What's left: connect succeeds, the request is sent, and literally nothing
+comes back for a full 8 seconds, every time, this boot. That's
+consistent with two different problems that look identical from the
+client side -- a response arriving very late (a real, severe network
+delay) vs. the request never actually reaching the server at all
+(matching this project's own much earlier `journalctl` finding of zero
+server-side record of the failing requests). Added a **temporary
+diagnostic, not a fix**: `calendar_client_get_calendar()`
+(`calendar_client.cpp`) now passes 60000 instead of the default 8000 for
+this call specifically, purely to see whether a response eventually shows
+up late. Meant to be reverted back to the plain default once that
+question is answered either way. Compiles clean (RAM 35.3%, Flash
+71.2%). **Not yet confirmed on hardware.**
+
+**Follow-up: answered, decisively, two ways at once.** The extended 60s
+read timeout above confirmed `/calendar` still hit the *full* 60059ms
+with zero response -- not late, genuinely never arrived. And checking
+`calendar_api.py`'s own logs directly (not inferring from the ESP32 side)
+confirmed zero `/calendar` requests logged for hours, despite periodic
+retries the whole time. Both point the same direction: the request is
+not reaching the server at all, matching this project's own much earlier
+`journalctl` finding from way back in this investigation.
+
+That sharpened the question: `/health`, called once at boot directly from
+the main/LVGL task, has never once failed to reach the server across this
+entire investigation. `/filters`/`/calendar`, called from `refresh_task`
+(a separate FreeRTOS task), apparently never do right now. Same server,
+same LAN, same code up through `connect()` (which reports success every
+time) -- the one variable that differs is which task sends the request.
+
+**Temporary diagnostic, not a fix, and not meant to stay:** `refresh_events()`
+(`calendar_view.cpp`) now calls `calendar_client_get_filters()`/
+`calendar_client_get_calendar()` synchronously, directly on the main/LVGL
+task, instead of spawning `refresh_task()` (left fully intact, just
+unused while this is in place, for a clean revert). This reintroduces the
+screen-freeze-during-fetch problem this file was originally rewritten to
+avoid -- deliberately, for one capture, to isolate task context as the
+variable: if calls from the main task also start failing, the
+task-context theory is wrong and something else explains all of this; if
+they keep succeeding the way `/health` always has, it's confirmed, and
+the next step is figuring out why a background-task-issued send doesn't
+reach the server while a main-task one does. Compiles clean (RAM 35.3%,
+Flash 71.2%). **Not yet confirmed on hardware.**
+
+**Follow-up: confirmed, cleanly -- every one of the three synchronous,
+main-task calls in that capture succeeded in under 100ms, matching
+`/health`'s unbroken record across the whole investigation.** Checked
+which core the main task actually runs on: `ARDUINO_RUNNING_CORE = 1`,
+confirmed directly in this build's own `sdkconfig.h`, not assumed.
+`refresh_task()` has been using `tskNO_AFFINITY` since an earlier fix (an
+explicit core-0 pin caused a *different* failure mode -- connect()
+itself failing, from contending with WiFi/lwIP's own core-0-default
+internal tasks). `tskNO_AFFINITY` doesn't just mean "no pin, pick one" --
+FreeRTOS-SMP can migrate an unpinned task between cores across
+preemption points during its own lifetime, so even two calls within one
+`refresh_task()` invocation could land on different cores. That fits
+everything observed: intermittent rather than constant failure, and (in
+one earlier capture) `/filters` succeeding immediately followed by
+`/calendar` failing in the same task invocation -- consistent with a
+core hop landing one call on 1 (fine) and the next on 0 (where sends
+apparently don't reliably reach the network) mid-task.
+
+Reverted the temporary main-task diagnostic back to the background
+`refresh_task()` design (screen responsiveness during a fetch still
+matters, independent of this bug), but changed its core affinity from
+`tskNO_AFFINITY` to `ARDUINO_RUNNING_CORE` explicitly -- pinned to the one
+core this project has now directly confirmed a request actually gets
+through from, rather than left to the scheduler's own placement. Also
+reverted `calendar_client_get_calendar()`'s temporary 60000ms diagnostic
+timeout back to the plain `default_timeout_ms` -- it already answered its
+question (a stuck read never got a response even given a full 60s, not
+just late) and there's no reason to keep two changes conflated in the
+same test. Compiles clean (RAM 35.3%, Flash 71.2%). **Not yet confirmed
+on hardware** -- this is the most mechanism-backed, evidence-driven fix
+in the entire investigation: not a guess at a plausible layer, a specific
+configuration change directly targeting the one variable that's been
+shown, by direct A/B comparison on real hardware, to actually matter.
+
+**Follow-up: disproven, cleanly, by the very next capture -- pinning
+`refresh_task()` to `ARDUINO_RUNNING_CORE` made no difference. Every
+request from it still failed the identical way, while `/health` from the
+main task still succeeded, confirmed against `calendar_api.py`'s own
+access log again (only `/health` arrived).** That ruled out core affinity
+as the deciding factor entirely -- not "which core," specifically "the
+original `loopTask`, versus any separately-created task," even one
+configured identically.
+
+Given direct, repeated proof that synchronous main-task calls complete
+reliably in well under 150ms, and that the entire reason `refresh_task()`
+existed (surviving up-to-65s Cloudflare-era fetches) stopped applying
+once `calendar_api.py` was restructured to answer from a fast local
+cache, the background task was removed entirely rather than debugged
+further. `refresh_events()` (`calendar_view.cpp`) is synchronous now --
+the same code that's been reliable in every single capture since this was
+isolated. `refresh_task()`, `RefreshResult`, `refresh_result_queue`,
+`refresh_in_flight`, and `pending_refresh_requested` are all gone; so is
+`http_mutex()` (`calendar_client.cpp`), which existed solely to guard
+against concurrent access from multiple tasks -- with no more background
+task anywhere in the project (confirmed: `grep -r xTaskCreate` across
+`src/` now returns nothing), nothing can call these functions
+concurrently anymore, so there's nothing left to serialize. `main.cpp`'s
+boot-delay experiment and `configTzTime()`'s relocation (both from
+ruled-out theories earlier in this same investigation) were reverted to
+their original, simpler form too -- there's no longer a separate
+background fetch for boot timing to matter to either way.
+
+This does mean a fetch briefly freezes the screen (no redraws, no clock,
+no alerts) for however long it takes -- a real, accepted tradeoff, not an
+oversight. Every successful capture throughout this whole investigation
+has shown that taking well under 150ms, and it only runs once per
+`poll_interval_ms` (10 minutes) or on an explicit user/event action, not
+continuously -- a small, infrequent cost in exchange for actually
+working, versus a background design that's been silently failing for an
+unknown fraction of this project's runtime. Compiles clean (RAM 35.3%,
+Flash 71.2%). **Not yet confirmed on hardware over an extended period**,
+but every underlying call has already been confirmed working repeatedly;
+this just stops routing it through the one thing that's been breaking it.
+
+## 2026-08: post-event refresh missed actual values, even hours later
+
+Reported directly: an 8:30 event's actual value never showed up on
+screen, and checking `calendar_api.py` directly confirmed it wasn't just
+an ESP32-side symptom -- the backend's own cache never had it either.
+Two separate, real gaps, fixed on both sides:
+
+**ESP32 side (`alert_manager.cpp`):** `alert_manager_tick()` used to try
+exactly *one* post-event refresh, in a 30-40s window, then mark that
+event permanently done via `refreshed_ids`. `calendar_api.py`'s own
+background refresh runs on its own clock near an event, not synchronized
+to that event's exact scheduled time -- a single fixed-window check could
+easily land in the gap between the backend's last refresh and its next
+one, missing a value that would have shown up if anyone had asked again a
+few minutes later. Replaced the single window with multiple checkpoints
+(`refresh_checkpoints_s`: 30s, 90s, 210s, 390s after an event), each
+firing once, spaced further apart over time -- close together early (a
+value landing right on schedule is the common case), further apart later
+(chasing a genuinely delayed report without polling forever).
+`refreshed_ids` (a simple "done" list) became `refresh_progress`, tracking
+how far through those checkpoints each event has gotten.
+
+**Backend side (`calendar_api.py`):** a real, separate bug, not just a
+cadence-tuning issue -- see `LXC/README.md`'s own writeup. The background
+refresh loop's adaptive cadence could sleep through an entire 3-hour long
+interval without ever re-checking whether an event had entered its
+30-minute proximity window, meaning the short cadence could go an event's
+entire relevant window without engaging at all. Fixed so the loop never
+sleeps longer than a minute at a stretch regardless of which interval is
+nominally in effect, and the short cadence itself tightened from 5
+minutes to 1 minute to leave less of a gap for the ESP32's own
+checkpoints to land in.
+
+Together: the ESP32 now checks several times instead of once, and the
+backend now reliably notices when it should be refreshing more often in
+the first place, instead of potentially missing that window entirely.
+Compiles clean (ESP32: RAM 35.3%, Flash 71.2%; backend: verified directly
+against the actual scheduling logic, not just read through -- a simulated
+cadence transition mid-sleep now triggers a refresh right when the
+transition happens, not at the end of the original long interval). **Not
+yet confirmed against a real event on hardware** -- the next scheduled
+release is the real test.
+
 ## Known quirks
 
 - `esp32-s3-devkitc-1-myboard.json` is copied from Elecrow's example

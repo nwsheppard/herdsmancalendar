@@ -14,10 +14,26 @@ struct TimedEvent {
 
 std::vector<TimedEvent> timed_events;
 
-// Per-event-id "already done" tracking so a threshold staying crossed for
-// several ticks (the ~1-minute refresh window) doesn't repeat the refresh
-// every single tick.
-std::vector<long> refreshed_ids;
+// Per-event-id progress through refresh_checkpoints_s (below) -- tracks
+// how many of those checkpoints have already fired for a given event, so
+// a threshold staying crossed for several ticks doesn't repeat the same
+// refresh every single tick.
+struct EventRefreshProgress {
+    long id;
+    size_t next_checkpoint = 0;
+};
+std::vector<EventRefreshProgress> refresh_progress;
+
+EventRefreshProgress & progress_for(long id)
+{
+    for (EventRefreshProgress & progress : refresh_progress) {
+        if (progress.id == id) {
+            return progress;
+        }
+    }
+    refresh_progress.push_back({id, 0});
+    return refresh_progress.back();
+}
 
 struct ActiveEvent {
     long id;
@@ -39,22 +55,28 @@ constexpr uint32_t check_interval_ms = 1000;
 long next_test_event_id = -1;
 
 constexpr long countdown_window_s = 10 * 60;
-constexpr long refresh_delay_s = 30;
-// Upper bound on the refresh window: a tick lands close to once a second,
-// so without some slack a single check exactly at +30s could be missed
-// between ticks. 40s gives an ample margin while still being clearly
-// "shortly after," not "sometime later."
-constexpr long refresh_window_s = 40;
 
-bool contains(const std::vector<long> & ids, long id)
-{
-    for (long existing : ids) {
-        if (existing == id) {
-            return true;
-        }
-    }
-    return false;
-}
+// Checkpoints (seconds after an event's own scheduled time) to refresh at
+// -- not just one. Reported directly from hardware: an 8:30 event's actual
+// value hadn't landed on screen even after the original single 30-40s
+// post-event refresh. Root cause: calendar_api.py's own background cache
+// refreshes near an event on its own clock (every
+// CALENDAR_REFRESH_INTERVAL_SHORT_S, 5 minutes by default -- see its own
+// module docstring), not synchronized to any specific event's exact
+// scheduled time. A single fixed-window check can land in the gap right
+// after the backend's last refresh and before its next one, missing a
+// value that would have shown up if anyone had asked again a few minutes
+// later. Multiple checkpoints, spaced further apart each time, give that
+// gap room to close without polling continuously forever: close together
+// early (a value landing right around its release time is the common
+// case), further apart later (chasing a genuinely delayed report, not
+// wasting fetches indefinitely).
+constexpr long refresh_checkpoints_s[] = {30, 90, 210, 390};
+constexpr size_t refresh_checkpoint_count = sizeof(refresh_checkpoints_s) / sizeof(refresh_checkpoints_s[0]);
+// Tolerance around each checkpoint -- a tick lands close to once a second,
+// not exactly, so without some slack a checkpoint could be missed between
+// ticks.
+constexpr long refresh_checkpoint_window_s = 15;
 
 /**
  * Parses CalendarEvent.day ("Fri Jul 27") + .time ("8:30am") into a real
@@ -213,10 +235,26 @@ void alert_manager_tick()
         }
 
         const long seconds_since = -seconds_until;
-        if (seconds_since >= refresh_delay_s && seconds_since <= refresh_window_s &&
-            !contains(refreshed_ids, event.id)) {
-            refreshed_ids.push_back(event.id);
+        if (seconds_since < 0) {
+            continue;
+        }
+
+        EventRefreshProgress & progress = progress_for(event.id);
+        if (progress.next_checkpoint >= refresh_checkpoint_count) {
+            continue; // already worked through every checkpoint for this event
+        }
+
+        const long checkpoint = refresh_checkpoints_s[progress.next_checkpoint];
+        if (seconds_since >= checkpoint && seconds_since <= checkpoint + refresh_checkpoint_window_s) {
+            ++progress.next_checkpoint;
             calendar_view_refresh();
+        } else if (seconds_since > checkpoint + refresh_checkpoint_window_s) {
+            // Missed this checkpoint's own window entirely (a tick gap,
+            // e.g. right after boot for an event that was already past
+            // this checkpoint) -- move on to the next one's own timing
+            // rather than firing a late catch-up refresh outside the
+            // window this checkpoint was actually meant to represent.
+            ++progress.next_checkpoint;
         }
     }
 }

@@ -506,6 +506,20 @@ void setup()
     // Milestone 5: hold the completed boot log on screen briefly, then move
     // to the calendar view (Milestone 7 wires in the real fetch behind
     // calendar_view_create() itself, so nothing here needed to change).
+    //
+    // (2026-08 footnote: this delay, and configTzTime()'s own position
+    // below, both went through a round of "does boot timing matter"
+    // experimentation while chasing an intermittent calendar-fetch
+    // failure -- a longer delay here, and moving configTzTime() to fire
+    // after this point instead of right after WiFi connects, on the
+    // theory that NTP's own background DNS/network activity was
+    // contending with the calendar fetch. Both were cleanly ruled out
+    // (see the README's own writeup) once the real cause was found: a
+    // background FreeRTOS task's requests weren't reaching the server at
+    // all, regardless of timing. calendar_view_create() below now fetches
+    // synchronously, on this same task, so there's no longer a separate
+    // background fetch for boot timing to matter to either way -- both
+    // reverted to their original, simpler form.)
     delay(1500);
     lv_obj_t * calendar_screen = calendar_view_create();
     lv_screen_load(calendar_screen);
