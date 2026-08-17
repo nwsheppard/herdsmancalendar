@@ -412,6 +412,30 @@ themselves being blanked.
   from a hardcoded 3-char substring to "skip to the first space" to match,
   since a hardcoded skip would silently break the moment this field
   gained a space.
+- `/calendar?range=week` used to come back with only the first 2-3 days of
+  the week populated, silently -- reported directly (2026-08): the ESP32's
+  week view showed a mostly-blank week even though forexfactory.com's own
+  page had the full week's data. Confirmed directly by saving the exact
+  HTML `fetch_calendar_html()` was parsing: Forex Factory's `week=this`
+  view really does put all 7 days' `<tr>` rows in the response, in one
+  single `table.calendar__table` (not a lazy-loaded/paginated table, which
+  would've been the easier bug to spot) -- but days beyond a couple out
+  from today come back as bare `calendar__cell--blank` placeholder cells
+  with no `calendar__event` (or any other `calendar__*` data cell) inside
+  them at all. Forex Factory's own front end evidently fills those in with
+  a later JS/AJAX call that FlareSolverr's single `request.get` never
+  triggers or waits for -- confirmed directly that a single-day fetch for a
+  specific date several days out (`day=aug20.2026`) comes back fully
+  populated, no blank cells, ruling out session/auth state as the cause.
+  Fixed by never fetching `week=this` at all anymore --
+  `fetch_week_calendar_events()` assembles the week from 7 individual
+  `day=` fetches (Sunday through Saturday) and merges them, since those are
+  confirmed to always come back fully rendered regardless of how far out
+  the date is. Costs 7 FlareSolverr round trips per week refresh instead of
+  1, which is still cheap at the 3-hour steady-state cadence (and the same
+  proximity-window cost tradeoff already accepted for the short cadence
+  elsewhere in this file/README applies here too, since both ranges refresh
+  together).
 - A cache layer would be a good next step if the API is polled frequently.
 
 ## License

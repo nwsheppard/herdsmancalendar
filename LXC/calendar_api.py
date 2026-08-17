@@ -130,7 +130,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 from curl_cffi import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import asynccontextmanager
 from urllib.parse import quote
@@ -514,11 +514,14 @@ def _set_forex_factory_timezone(cookies: list) -> list:
     return _merge_cookies(cookies_after_get, post_solution.get("cookies", []))
 
 
-def fetch_calendar_html(cal_type: str) -> str:
-    # Forex Factory accepts literal "today"/"this" aliases directly (verified
-    # directly) -- no need to compute or pass an actual date string.
-    param = "day=today" if cal_type == "day" else "week=this"
-    url = f"{BASE_URL}?{param}"
+def fetch_calendar_html(query_param: str) -> str:
+    """
+    Fetches raw calendar HTML for one Forex Factory query param, e.g.
+    "day=today" or "day=aug20.2026" -- always a single day's worth of
+    markup. Forex Factory's own week=this view is deliberately never used
+    here anymore -- see fetch_week_calendar_events()'s docstring for why.
+    """
+    url = f"{BASE_URL}?{query_param}"
 
     if not FLARESOLVERR_URL:
         raise RuntimeError(
@@ -570,6 +573,50 @@ def fetch_calendar_html(cal_type: str) -> str:
 
     _save_session_cookies(cookies)
     return html
+
+
+def _week_day_query_params(now: datetime) -> list[str]:
+    """
+    Forex Factory "day=..." query params ("day=aug17.2026", ...) for each
+    day of the week containing `now`, Sunday through Saturday -- see
+    fetch_week_calendar_events() for why "week" is assembled from these
+    instead of Forex Factory's own week=this view.
+    """
+    days_since_sunday = (now.weekday() + 1) % 7  # datetime.weekday(): Mon=0..Sun=6
+    week_start = now - timedelta(days=days_since_sunday)
+    return [f"day={(week_start + timedelta(days=i)).strftime('%b%d.%Y').lower()}" for i in range(7)]
+
+
+def fetch_week_calendar_events(now: datetime) -> list[dict]:
+    """
+    Assembles a full week's events from 7 individual day fetches instead of
+    Forex Factory's own week=this view.
+
+    Reported directly (2026-08): /calendar?range=week was serving data for
+    only the first 2-3 days of the week even though forexfactory.com's own
+    page showed the full week fine. Confirmed directly: week=this's HTML
+    has all 7 days' <tr> rows present, in one single calendar__table (not a
+    separate/paginated table per day, which would've been the easier bug to
+    find) -- but days beyond a couple out from today come back as bare
+    calendar__cell--blank placeholder cells with no calendar__event (or any
+    other calendar__* data cell) inside them at all. Forex Factory's own
+    front end evidently fills those in with a later JS/AJAX call that
+    FlareSolverr's single request.get never triggers or waits for. A
+    specific-date single-day fetch (day=aug20.2026, tested directly against
+    a date several days out from today), by contrast, comes back fully
+    populated, no blank cells -- so assembling the week from 7 of those
+    instead sidesteps the lazy-render gap entirely, at the cost of 7
+    FlareSolverr round trips instead of 1 per week refresh. Still cheap at
+    the 3-hour steady-state cadence; see CALENDAR_REFRESH_INTERVAL_SHORT_S's
+    own comment for the proximity-window load tradeoff already accepted
+    elsewhere in this file, which applies here too since _refresh_calendar_cache
+    refreshes both ranges together.
+    """
+    events = []
+    for query_param in _week_day_query_params(now):
+        html = fetch_calendar_html(query_param)
+        events.extend(parse_calendar(html))
+    return events
 
 
 def parse_value_state(cell) -> str:
@@ -851,8 +898,11 @@ def _refresh_calendar_cache(range: str) -> None:
     changes rather than a timer.
     """
     try:
-        html = fetch_calendar_html(range)
-        events = parse_calendar(html)
+        if range == "week":
+            events = fetch_week_calendar_events(datetime.now(CALENDAR_TIMEZONE))
+        else:
+            html = fetch_calendar_html("day=today")
+            events = parse_calendar(html)
     except requests.exceptions.RequestException as e:
         log.error("Background refresh of /calendar?range=%s failed: %s", range, e)
         return
