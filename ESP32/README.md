@@ -2651,6 +2651,58 @@ transition happens, not at the end of the original long interval). **Not
 yet confirmed against a real event on hardware** -- the next scheduled
 release is the real test.
 
+## 2026-08: week view showed only a couple days of the week, then a FlareSolverr outage went unnoticed for hours
+
+Two separate incidents, same underlying theme -- `calendar_api.py`'s
+background refresh can fail in ways that leave stale-but-plausible data on
+screen with nothing telling anyone it happened.
+
+**`/calendar?range=week` only had Sunday-Tuesday populated.** Reported
+directly: the week view was mostly blank even though forexfactory.com's own
+page showed the full week fine. Confirmed directly by saving the exact HTML
+`fetch_calendar_html()` was parsing: Forex Factory's `week=this` view really
+does include all 7 days' `<tr>` rows, in one single `table.calendar__table`
+-- but days beyond a couple out from today come back as bare
+`calendar__cell--blank` placeholder cells with no `calendar__event` (or any
+other `calendar__*` data cell) inside them at all, evidently filled in by
+Forex Factory's own front-end JS after load, which FlareSolverr's single
+`request.get` never waits for. A specific-date single-day fetch
+(`day=aug20.2026`), by contrast, confirmed directly to come back fully
+populated regardless of how far out the date is. Fixed by never using
+`week=this` at all -- `fetch_week_calendar_events()` assembles the week from
+7 individual `day=` fetches (Sunday through Saturday) and merges them. See
+`LXC/README.md`'s own writeup for the full diagnostic trail.
+
+**The day view was stuck showing yesterday's events, hours into the new
+day.** Traced directly to `journalctl`: FlareSolverr had gone unreachable
+overnight (`Failed to connect to ... port 8191`), every background refresh
+attempt since had failed and logged it, and `calendar_api.py`'s own
+"refresh failure leaves the cache untouched" design (exactly right for
+surviving a transient blip) meant `/calendar` kept answering `200 OK` with
+yesterday's last-good data indefinitely, no different from a genuinely
+fresh response. Nothing was actually broken in this project's own code --
+FlareSolverr itself needed restarting -- but there was no way for the ESP32
+(or anyone glancing at the screen) to tell "current" from "hours stale"
+without going and reading server logs by hand.
+
+Fixed by making that distinction visible: `_build_calendar_response()` now
+returns `refresh_ok` (whether `range`'s most recent refresh *attempt*
+succeeded, tracked separately from whether the cache has data at all) and
+`data_updated_at` (when the cached data was actually fetched -- this field
+used to exist as `fetched_at` but always just read `datetime.utcnow()`,
+which meant it was silently useless for exactly this purpose, always
+"now" regardless of how stale the underlying data actually was).
+`calendar_client_get_calendar()` (`calendar_client.cpp`) takes a new
+`refresh_ok_out` out-param reading that field (defaulting to `true` if
+missing, so an older backend without it never false-alarms), and
+`refresh_events()` (`calendar_view.cpp`) shows a status-line warning
+("calendar server can't refresh data -- showing last known values") when a
+fetch succeeds but the backend's own refresh is failing, instead of no
+indication at all. Compiles clean (RAM 35.3%, Flash 71.2%); backend
+verified with `py_compile`. Not yet exercised against a real FlareSolverr
+outage on hardware -- next one will be the real test of whether the warning
+actually surfaces in time to be useful.
+
 ## Known quirks
 
 - `esp32-s3-devkitc-1-myboard.json` is copied from Elecrow's example

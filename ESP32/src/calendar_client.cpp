@@ -181,7 +181,7 @@ bool calendar_client_get_columns(std::vector<StringOption> & out)
     return fetch_string_options("/columns", out);
 }
 
-bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out)
+bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out, bool & refresh_ok_out)
 {
     // calendar_api.py answers this from its own background-refreshed
     // cache -- a plain local read, always fast -- so this uses the same
@@ -243,6 +243,13 @@ bool calendar_client_get_calendar(const String & range, std::vector<CalendarEven
     Serial.printf("Parsed /calendar body: %u events in %lums, ending t=%lums\n",
                   static_cast<unsigned>(result.size()),
                   static_cast<unsigned long>(millis() - parse_start_ms), static_cast<unsigned long>(millis()));
+
+    // isNull() (not just as<bool>() on a possibly-missing key): an older
+    // calendar_api.py without this field would make ArduinoJson's [] return
+    // a null JsonVariant, and as<bool>() on that returns false -- exactly
+    // the "backend is failing" state, backwards, against a backend that's
+    // actually fine and simply predates this field entirely.
+    refresh_ok_out = doc["refresh_ok"].isNull() ? true : doc["refresh_ok"].as<bool>();
 
     out = result;
     return true;

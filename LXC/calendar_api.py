@@ -302,6 +302,19 @@ _calendar_cache: dict[str, dict] = {}
 # should be "just the display of the webpage," reacting to changes instead
 # of deciding on its own schedule when to go looking for them.
 _calendar_versions: dict[str, int] = {}
+# Whether `range`'s most recent refresh *attempt* succeeded -- distinct from
+# whether the cache currently has data at all. A background refresh failure
+# (FlareSolverr down, Forex Factory unreachable, a parse error) never
+# touches _calendar_cache, so /calendar keeps serving the last good data
+# with a plain 200 OK -- exactly right for staying up through a transient
+# blip, but it also means a client has no way to tell "this is current"
+# from "this hasn't actually updated in hours" purely from a successful
+# response. Reported directly (2026-08): FlareSolverr was down for ~6 hours
+# overnight, every refresh in that window failed and logged it here, but
+# the ESP32 kept right on showing yesterday's data with no indication
+# anything was wrong -- this is what lets a client surface that itself. See
+# _build_calendar_response()'s "refresh_ok"/"data_updated_at" fields.
+_calendar_refresh_ok: dict[str, bool] = {}
 # Protects concurrent dict access between the one background writer thread
 # and however many request-handling threads are reading at once -- not
 # guarding against concurrent *fetches* anymore, since only the background
@@ -905,15 +918,24 @@ def _refresh_calendar_cache(range: str) -> None:
             events = parse_calendar(html)
     except requests.exceptions.RequestException as e:
         log.error("Background refresh of /calendar?range=%s failed: %s", range, e)
+        with _calendar_cache_lock:
+            _calendar_refresh_ok[range] = False
         return
     except RuntimeError as e:
         log.error("Background refresh of /calendar?range=%s failed to parse: %s", range, e)
+        with _calendar_cache_lock:
+            _calendar_refresh_ok[range] = False
         return
 
     with _calendar_cache_cond:
         previous = _calendar_cache.get(range)
         changed = previous is None or previous["events"] != events
-        _calendar_cache[range] = {"events": events, "fetched_at": time.monotonic()}
+        # Wall-clock, not the time.monotonic() this briefly held -- this is
+        # what _build_calendar_response() now actually exposes to clients
+        # (see "data_updated_at"), and monotonic time has no meaning outside
+        # this one process to report back over the API.
+        _calendar_cache[range] = {"events": events, "fetched_at": datetime.now(CALENDAR_TIMEZONE)}
+        _calendar_refresh_ok[range] = True
         if changed:
             _calendar_versions[range] = _calendar_versions.get(range, 0) + 1
             _calendar_cache_cond.notify_all()
@@ -987,6 +1009,7 @@ def _build_calendar_response(range: str) -> JSONResponse:
     with _calendar_cache_lock:
         cached = _calendar_cache.get(range)
         version = _calendar_versions.get(range, 0)
+        refresh_ok = _calendar_refresh_ok.get(range, True)
 
     if cached is None:
         # Only possible in the brief window right after a fresh start,
@@ -1019,7 +1042,21 @@ def _build_calendar_response(range: str) -> JSONResponse:
     return JSONResponse({
         "range": range,
         "version": version,
-        "fetched_at": datetime.utcnow().isoformat(),
+        # When `range`'s cached data was actually last fetched -- not "now"
+        # (that was this field's original, misleading behavior: it always
+        # read datetime.utcnow(), regardless of how stale the cache
+        # actually was). refresh_ok reflects the most recent refresh
+        # *attempt* specifically, separate from data_updated_at's age: a
+        # background refresh failure (FlareSolverr down, Forex Factory
+        # unreachable, a parse error) never touches the cache, so this can
+        # be false even seconds after a perfectly fine previous fetch, and
+        # data_updated_at can be hours old during ordinary steady-state
+        # operation (CALENDAR_REFRESH_INTERVAL_LONG_S) without refresh_ok
+        # ever having gone false at all. A client wanting a "this might be
+        # stale" indicator should watch refresh_ok, not just data_updated_at's
+        # age -- see the ESP32 firmware's own use of this field.
+        "data_updated_at": cached["fetched_at"].isoformat(),
+        "refresh_ok": refresh_ok,
         "count": len(events),
         "events": events,
     })

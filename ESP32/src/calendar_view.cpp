@@ -641,10 +641,21 @@ void refresh_events()
     const bool show_ccy = !(calendar_client_get_filters(filters) && filters.currency_codes.size() == 1);
 
     std::vector<CalendarEvent> events;
-    const bool success = calendar_client_get_calendar(current_range, events);
+    bool refresh_ok = true;
+    const bool success = calendar_client_get_calendar(current_range, events, refresh_ok);
 
     if (success) {
         populate_events(events, show_ccy);
+        // Overwrites whatever populate_events() just set (including "no
+        // events match your filters") -- a request that succeeded but
+        // reflects calendar_api.py's own failing background refresh
+        // (FlareSolverr down, Forex Factory unreachable) is more important
+        // to surface than that, since it means everything on screen right
+        // now, empty list or not, may not actually be current. See
+        // calendar_client_get_calendar()'s own doc comment on refresh_ok.
+        if (!refresh_ok) {
+            lv_label_set_text(status_label, "Warning: calendar server can't refresh data -- showing last known values");
+        }
     } else {
         lv_obj_clean(list);
         lv_label_set_text(status_label, "Could not load events -- check the connection and try again.");

@@ -77,5 +77,22 @@ bool calendar_client_save_filters(const CalendarFilters & filters);
  * to changes instead of polling on a timer -- not used here; this project
  * settled on plain periodic polling instead, see calendar_view.cpp's
  * poll_interval_ms for why.)
+ *
+ * refresh_ok_out is set from the response's own "refresh_ok" field --
+ * whether calendar_api.py's *own* most recent background refresh attempt
+ * for this range succeeded, separate from whether this particular request
+ * succeeded. A background refresh failure (FlareSolverr down, Forex
+ * Factory unreachable) never clears calendar_api.py's cache, so this
+ * function can return true (a real HTTP 200 with real, parseable events)
+ * while refresh_ok_out comes back false -- that combination means "this is
+ * genuinely the last data calendar_api.py ever fetched successfully, but
+ * it's stopped being able to refresh it," which looks identical to fresh
+ * data from this function's own return value alone. Reported directly
+ * (2026-08): FlareSolverr was down for hours overnight and the screen kept
+ * showing yesterday's data with no indication anything was wrong -- this
+ * is what lets calendar_view.cpp surface that instead. Defaults to true if
+ * the field is missing (an older calendar_api.py without this field) so
+ * this never regresses into a false alarm against a backend that simply
+ * predates it.
  */
-bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out);
+bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out, bool & refresh_ok_out);
