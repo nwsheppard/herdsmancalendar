@@ -436,6 +436,24 @@ themselves being blanked.
   proximity-window cost tradeoff already accepted for the short cadence
   elsewhere in this file/README applies here too, since both ranges refresh
   together).
+- The service got SIGKILLed by systemd during a restart attempt, reported
+  directly (2026-08) with `journalctl` timestamps pinning the exact
+  mechanism: `lifespan()`'s one-time startup fetch called
+  `_refresh_calendar_cache()` directly, a synchronous/blocking `curl_cffi`
+  call, from inside an `async def` running on uvicorn's single event-loop
+  thread. Whenever that call was in flight (FlareSolverr was failing to
+  solve Forex Factory's challenge at the time, each attempt blocking for
+  its full ~60s timeout), the event loop was frozen solid -- including its
+  ability to process the SIGTERM systemd sent when something tried to
+  restart the service mid-startup. systemd waited the full default
+  `TimeoutStopSec` (90s) for a graceful exit that could never come, then
+  force-killed it. Fixed with `await asyncio.to_thread(_refresh_calendar_cache, range)`
+  instead of a direct call -- runs the same blocking work on a separate
+  thread so the event loop (and therefore signal handling) stays
+  responsive throughout. `_calendar_refresh_loop()`'s own background
+  refreshes were never affected by this -- that one already runs as a real
+  `threading.Thread`, not on the event loop, only this one-time startup
+  path had the bug.
 - A cache layer would be a good next step if the API is polled frequently.
 
 ## License

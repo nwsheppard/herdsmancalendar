@@ -135,6 +135,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
+import asyncio
 import json
 import logging
 import os
@@ -155,8 +156,7 @@ async def lifespan(app: FastAPI):
     # (nothing to look at yet, no filters set, no obvious reason why).
     load_filters()
 
-    # Synchronous, not left to the background thread's first cycle: this
-    # blocks startup for as long as it takes (up to ~65s x2 in the worst
+    # Blocks startup for as long as it takes (up to ~65s x2 in the worst
     # case, both ranges needing a timezone self-heal), but that's a
     # one-time cost paid once per restart, not something every client pays
     # -- and it means /calendar has real data to serve from the moment
@@ -164,8 +164,26 @@ async def lifespan(app: FastAPI):
     # 503 window right after every restart. Logged but non-fatal if it
     # fails (e.g. FlareSolverr isn't reachable yet at boot) -- the
     # background loop below retries on its own regardless.
+    #
+    # await asyncio.to_thread(...), not a direct call -- reported directly
+    # (2026-08): systemd SIGKILLed this service after a restart attempt
+    # timed out waiting for a graceful shutdown. Root cause: lifespan() is
+    # a coroutine running on uvicorn's single event-loop thread, and
+    # _refresh_calendar_cache() makes a synchronous, blocking curl_cffi
+    # call -- calling it directly here froze that entire event loop for
+    # however long the call took (up to FlareSolverr's own ~60s solve
+    # timeout), which also froze uvicorn's ability to even process the
+    # SIGTERM systemd sent it. systemd waited the full default
+    # TimeoutStopSec (90s) getting no response, then SIGKILLed the process
+    # -- confirmed directly against the exact timestamps in
+    # `journalctl -u herdsman-calendar-api`. asyncio.to_thread() runs the
+    # same blocking call on a separate worker thread instead, the same way
+    # _calendar_refresh_loop() below already does (as a real
+    # threading.Thread, not on the event loop) -- that background loop was
+    # never actually affected by this bug, only this one-time startup
+    # fetch was.
     for range in ("day", "week"):
-        _refresh_calendar_cache(range)
+        await asyncio.to_thread(_refresh_calendar_cache, range)
 
     refresh_thread = threading.Thread(target=_calendar_refresh_loop, daemon=True, name="calendar-refresh")
     refresh_thread.start()

@@ -2703,6 +2703,29 @@ verified with `py_compile`. Not yet exercised against a real FlareSolverr
 outage on hardware -- next one will be the real test of whether the warning
 actually surfaces in time to be useful.
 
+## 2026-08: no-events grid scene
+
+A quiet day (or a filter selection matching nothing) used to just show a
+plain text line where the event list would be. Replaced with a Tron/
+Hackers-style neon grid scene (`build_no_events_scene()`,
+`calendar_view.cpp`) instead: a perspective floor grid converging on a
+vanishing point at a horizon bar, plus a glowing "NO SCHEDULED EVENTS"
+headline, all in `THEME_COLOR_SPLASH_TERMINAL_GREEN` -- the same neon
+green the boot splash already established for this device, rather than a
+new one-off palette.
+
+Drawn entirely with `lv_line` primitives (a vanishing point, evenly-spaced
+converging verticals, and horizontal rungs spaced with a quadratic ease so
+straight lines read as receding into the distance) instead of a bitmap --
+flash was already at 71% from the boot splash's own 800x480 RGB565 image
+(~750KB alone), with no realistic room for a second full-screen bitmap at
+that format. The procedural version costs about 750 bytes of flash and 230
+bytes of RAM instead. Built once (`grid_width` is only computed once, right
+after boot, same as `list`/`header`) and toggled hidden/visible by
+`populate_events()`/`refresh_events()`'s failure branch rather than rebuilt
+per refresh. Compiles clean (RAM 35.3%, Flash 71.2% -- unchanged at this
+rounding).
+
 ## Known quirks
 
 - `esp32-s3-devkitc-1-myboard.json` is copied from Elecrow's example

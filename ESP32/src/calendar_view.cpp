@@ -60,6 +60,17 @@ lv_obj_t * week_tab_button = nullptr;
 lv_obj_t * list = nullptr;
 lv_obj_t * header = nullptr;
 lv_obj_t * status_label = nullptr;
+lv_obj_t * no_events_scene = nullptr;
+
+// Perspective floor grid line counts for no_events_scene -- see its own
+// comment. Fixed at compile time so no_events_grid_points below can be a
+// plain static array (LVGL only stores a pointer to a line's points, not a
+// copy -- see lv_line.h -- so this storage has to outlive every lv_line_t
+// built from it, which a namespace-scope array does for free).
+constexpr int no_events_vertical_lines = 7;
+constexpr int no_events_horizontal_lines = 6;
+constexpr int no_events_total_lines = no_events_vertical_lines + no_events_horizontal_lines + 1; // +1 horizon bar
+lv_point_precise_t no_events_grid_points[no_events_total_lines][2];
 
 // Computed once in build_events_ui() from the WiFi icon's actual rendered
 // position (see its own comment there) and reused by every later header
@@ -478,6 +489,92 @@ void make_no_server_message(lv_obj_t * parent)
     lv_obj_align(no_server_message, LV_ALIGN_CENTER, 0, 20);
 }
 
+/**
+ * Tron/Hackers-style neon grid scene, shown instead of the (empty) event
+ * list on a range with genuinely no scheduled events -- previously just a
+ * plain "No events match your current filters for this range." text line,
+ * which read identically whether the filters were excluding everything or
+ * the range was just quiet. Built once here, sized/positioned to exactly
+ * match `list`'s own bounds (grid_width x 300 at (20, 136)) since
+ * grid_width itself is only computed once, right after boot -- toggled
+ * hidden/visible by populate_events() rather than rebuilt per refresh.
+ *
+ * A perspective floor grid (vertical lines converging on a vanishing point
+ * at the horizon, horizontal rungs spaced with a quadratic ease so evenly-
+ * drawn straight lines read as receding into the distance) plus a horizon
+ * bar and a glowing headline, all in THEME_COLOR_SPLASH_TERMINAL_GREEN --
+ * the same neon-on-black palette main.cpp's boot splash already
+ * established for this device, rather than inventing a new one-off scheme.
+ */
+void build_no_events_scene(lv_obj_t * screen)
+{
+    no_events_scene = lv_obj_create(screen);
+    lv_obj_remove_style_all(no_events_scene);
+    lv_obj_set_size(no_events_scene, grid_width, 300);
+    lv_obj_align(no_events_scene, LV_ALIGN_TOP_LEFT, 20, 136);
+    lv_obj_add_flag(no_events_scene, LV_OBJ_FLAG_HIDDEN);
+
+    constexpr int16_t horizon_y = 150;
+    constexpr int16_t floor_bottom_y = 280;
+    constexpr int16_t floor_margin_x = 40;
+    const int16_t vanishing_x = grid_width / 2;
+    const int16_t floor_left_x = floor_margin_x;
+    const int16_t floor_right_x = grid_width - floor_margin_x;
+
+    int line_index = 0;
+    auto make_line = [&](lv_point_precise_t a, lv_point_precise_t b, int16_t width) {
+        no_events_grid_points[line_index][0] = a;
+        no_events_grid_points[line_index][1] = b;
+        lv_obj_t * line = lv_line_create(no_events_scene);
+        lv_line_set_points(line, no_events_grid_points[line_index], 2);
+        lv_obj_set_style_line_color(line, lv_color_hex(THEME_COLOR_SPLASH_TERMINAL_GREEN), 0);
+        lv_obj_set_style_line_width(line, width, 0);
+        lv_obj_set_style_line_opa(line, LV_OPA_COVER, 0);
+        ++line_index;
+    };
+
+    // Horizon bar first -- full width, so it's drawn under the converging
+    // verticals below rather than over them.
+    make_line({0, horizon_y}, {static_cast<lv_value_precise_t>(grid_width), horizon_y}, 2);
+
+    // Converging verticals: vanishing point -> evenly-spaced points along
+    // the floor's bottom edge.
+    for (int i = 0; i < no_events_vertical_lines; ++i) {
+        const float t = static_cast<float>(i) / (no_events_vertical_lines - 1);
+        const int16_t bottom_x = static_cast<int16_t>(floor_left_x + t * (floor_right_x - floor_left_x));
+        make_line({vanishing_x, horizon_y}, {bottom_x, floor_bottom_y}, 1);
+    }
+
+    // Horizontal rungs -- quadratic easing (t*t) packs more lines near the
+    // horizon and fewer near the bottom, the standard trick for faking
+    // perspective with straight, evenly-drawn lines. x bounds at each rung
+    // are interpolated toward the vanishing point the same fraction t,
+    // keeping every rung's endpoints exactly on the two outer converging
+    // lines instead of just guessing a width.
+    for (int i = 1; i <= no_events_horizontal_lines; ++i) {
+        const float t = static_cast<float>(i) / no_events_horizontal_lines;
+        const float eased = t * t;
+        const int16_t y = static_cast<int16_t>(horizon_y + eased * (floor_bottom_y - horizon_y));
+        const int16_t left_x = static_cast<int16_t>(vanishing_x + (floor_left_x - vanishing_x) * t);
+        const int16_t right_x = static_cast<int16_t>(vanishing_x + (floor_right_x - vanishing_x) * t);
+        make_line({left_x, y}, {right_x, y}, 1);
+    }
+
+    // Faux-bold headline -- same 1px-offset-duplicate technique main.cpp's
+    // boot splash uses (LVGL's bitmap fonts have no bold variant).
+    lv_obj_t * headline_shadow = lv_label_create(no_events_scene);
+    lv_label_set_text(headline_shadow, "NO SCHEDULED EVENTS");
+    lv_obj_set_style_text_color(headline_shadow, lv_color_hex(THEME_COLOR_SPLASH_TERMINAL_GREEN), 0);
+    lv_obj_set_style_text_font(headline_shadow, &lv_font_spacemono_32, 0);
+    lv_obj_align(headline_shadow, LV_ALIGN_TOP_MID, 1, 40);
+
+    lv_obj_t * headline = lv_label_create(no_events_scene);
+    lv_label_set_text(headline, "NO SCHEDULED EVENTS");
+    lv_obj_set_style_text_color(headline, lv_color_hex(THEME_COLOR_SPLASH_TERMINAL_GREEN), 0);
+    lv_obj_set_style_text_font(headline, &lv_font_spacemono_32, 0);
+    lv_obj_align(headline, LV_ALIGN_TOP_MID, 0, 40);
+}
+
 /** Builds the tabs/header/list/status pieces -- shared by first boot and a later calendar_view_refresh(). */
 void build_events_ui(lv_obj_t * screen)
 {
@@ -527,6 +624,8 @@ void build_events_ui(lv_obj_t * screen)
     // spacemono_18, same reasoning as no_server_message above.
     lv_obj_set_style_text_font(status_label, &lv_font_spacemono_18, 0);
     lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, 220);
+
+    build_no_events_scene(screen);
 }
 
 /**
@@ -567,10 +666,14 @@ void populate_events(const std::vector<CalendarEvent> & events, bool show_ccy)
     timed_timer_handler("populate_events header rebuild");
 
     if (events.empty()) {
-        lv_label_set_text(status_label, "No events match your current filters for this range.");
+        lv_obj_add_flag(list, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(no_events_scene, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(status_label, "");
         return;
     }
 
+    lv_obj_add_flag(no_events_scene, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(status_label, "");
     String last_day;
     for (const CalendarEvent & event : events) {
@@ -646,17 +749,24 @@ void refresh_events()
 
     if (success) {
         populate_events(events, show_ccy);
-        // Overwrites whatever populate_events() just set (including "no
-        // events match your filters") -- a request that succeeded but
-        // reflects calendar_api.py's own failing background refresh
-        // (FlareSolverr down, Forex Factory unreachable) is more important
-        // to surface than that, since it means everything on screen right
-        // now, empty list or not, may not actually be current. See
-        // calendar_client_get_calendar()'s own doc comment on refresh_ok.
+        // Overwrites whatever populate_events() just set -- a request that
+        // succeeded but reflects calendar_api.py's own failing background
+        // refresh (FlareSolverr down, Forex Factory unreachable) is more
+        // important to surface than that, since it means everything on
+        // screen right now, empty list or not, may not actually be
+        // current. See calendar_client_get_calendar()'s own doc comment on
+        // refresh_ok.
         if (!refresh_ok) {
             lv_label_set_text(status_label, "Warning: calendar server can't refresh data -- showing last known values");
         }
     } else {
+        // Also hides no_events_scene/shows list -- a fetch can fail right
+        // after a previous refresh left the no-events grid scene visible
+        // (an empty range, then a dropped connection before the next
+        // refresh), and this error message needs the plain list area back,
+        // not that scene still sitting on top of it.
+        lv_obj_add_flag(no_events_scene, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(list, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clean(list);
         lv_label_set_text(status_label, "Could not load events -- check the connection and try again.");
     }
