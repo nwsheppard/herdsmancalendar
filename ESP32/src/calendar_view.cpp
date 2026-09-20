@@ -61,6 +61,7 @@ lv_obj_t * list = nullptr;
 lv_obj_t * header = nullptr;
 lv_obj_t * status_label = nullptr;
 lv_obj_t * no_events_scene = nullptr;
+lv_obj_t * fomc_badge = nullptr;
 
 // Perspective floor grid line counts for no_events_scene -- see its own
 // comment. Fixed at compile time so no_events_grid_points below can be a
@@ -745,10 +746,25 @@ void refresh_events()
 
     std::vector<CalendarEvent> events;
     bool refresh_ok = true;
-    const bool success = calendar_client_get_calendar(current_range, events, refresh_ok);
+    bool fomc_this_week = false;
+    const bool success = calendar_client_get_calendar(current_range, events, refresh_ok, fomc_this_week);
 
     if (success) {
         populate_events(events, show_ccy);
+        // Only touched on success -- a transient fetch failure shouldn't
+        // flicker this off and back on by the next retry a few seconds
+        // later. fomc_this_week defaults to false on a failed call (see
+        // calendar_client_get_calendar()), so leaving it alone here means
+        // the badge simply keeps showing whatever it last knew, same as
+        // current_events would if this project chose to do the same for
+        // it (it doesn't, deliberately -- see current_events' own comment
+        // below; this is a much lower-stakes, weekly-timescale indicator,
+        // not something alert_manager acts on).
+        if (fomc_this_week) {
+            lv_obj_clear_flag(fomc_badge, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(fomc_badge, LV_OBJ_FLAG_HIDDEN);
+        }
         // Overwrites whatever populate_events() just set -- a request that
         // succeeded but reflects calendar_api.py's own failing background
         // refresh (FlareSolverr down, Forex Factory unreachable) is more
@@ -913,6 +929,31 @@ lv_obj_t * calendar_view_create()
     // icons in the first place.
     lv_obj_set_style_text_font(title, &lv_font_spacemono_32, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 10);
+
+    // Hidden unless calendar_api.py's own "fomc_this_week" flag says
+    // otherwise (see refresh_events()) -- reported directly (2026-08): the
+    // week view goes mostly unread day to day, so an FOMC week was easy to
+    // miss until it was already showing up on the day view. Anchored to
+    // title itself via lv_obj_align_to() rather than a fixed x offset --
+    // the gap this sits in is whatever's left between the title's own
+    // (content-sized) width and the gear/WiFi icons further right, not a
+    // fixed layout slot, so it needs to track the title's actual rendered
+    // width rather than assume one.
+    fomc_badge = lv_label_create(screen);
+    lv_label_set_text(fomc_badge, "FOMC WEEK");
+    lv_obj_set_style_text_color(fomc_badge, lv_color_hex(THEME_COLOR_IMPACT_HIGH), 0);
+    lv_obj_set_style_text_font(fomc_badge, &lv_font_spacemono_18, 0);
+    lv_obj_set_style_border_color(fomc_badge, lv_color_hex(THEME_COLOR_IMPACT_HIGH), 0);
+    lv_obj_set_style_border_width(fomc_badge, 2, 0);
+    lv_obj_set_style_border_opa(fomc_badge, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(fomc_badge, 3, 0);
+    lv_obj_set_style_pad_left(fomc_badge, 10, 0);
+    lv_obj_set_style_pad_right(fomc_badge, 10, 0);
+    lv_obj_set_style_pad_top(fomc_badge, 4, 0);
+    lv_obj_set_style_pad_bottom(fomc_badge, 4, 0);
+    lv_obj_add_flag(fomc_badge, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_update_layout(title); // same reasoning as wifi_icon_label's own update_layout() call below -- align_to needs title's real rendered width, not a stale/unresolved one.
+    lv_obj_align_to(fomc_badge, title, LV_ALIGN_OUT_RIGHT_MID, 16, 0);
 
     // WiFi status icon takes the corner spot the gear used to occupy; the
     // gear moves left to make room. Same color/strike convention as

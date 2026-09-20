@@ -181,7 +181,8 @@ bool calendar_client_get_columns(std::vector<StringOption> & out)
     return fetch_string_options("/columns", out);
 }
 
-bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out, bool & refresh_ok_out)
+bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out, bool & refresh_ok_out,
+                                   bool & fomc_this_week_out)
 {
     // calendar_api.py answers this from its own background-refreshed
     // cache -- a plain local read, always fast -- so this uses the same
@@ -250,6 +251,10 @@ bool calendar_client_get_calendar(const String & range, std::vector<CalendarEven
     // the "backend is failing" state, backwards, against a backend that's
     // actually fine and simply predates this field entirely.
     refresh_ok_out = doc["refresh_ok"].isNull() ? true : doc["refresh_ok"].as<bool>();
+    // Same isNull() reasoning as refresh_ok_out -- an older calendar_api.py
+    // without this field should read as "no FOMC week flagged," not crash
+    // or silently misbehave, and false is already that default.
+    fomc_this_week_out = doc["fomc_this_week"].isNull() ? false : doc["fomc_this_week"].as<bool>();
 
     out = result;
     return true;

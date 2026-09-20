@@ -2,7 +2,41 @@
 # (context: .. below means "repo root" -- this file lives in Docker/, one
 # level under it -- so this works regardless of your current directory as
 # long as the path to this file is correct.)
+#
+# Byparr is bundled below -- a full anyone-can-drop-this-in stack needs a
+# Cloudflare-challenge solver either way (see calendar_api.py's module
+# docstring), and asking every Docker user to also stand up a *second*
+# separate service/container just to get that, on their own, was real
+# friction FlareSolverr's own setup used to impose here (still does, if you
+# use it instead). Byparr (https://github.com/ThePhaseless/Byparr) was
+# chosen over FlareSolverr specifically because it actually clears current
+# Cloudflare Turnstile/Managed Challenge -- FlareSolverr's Selenium/
+# undetected-chromedriver approach reliably failed against Forex Factory's
+# 2026-08 Turnstile rollout (confirmed directly: every solve attempt timed
+# out after FlareSolverr's own 60s budget), while Byparr's Camoufox-backed
+# solver cleared it. Same FlareSolverr-compatible /v1 API and default port
+# (8191), so calendar_api.py needed zero code changes either way -- see
+# LXC/README.md's own writeup of that investigation for the full story.
+#
+# Prefer running your own FlareSolverr or Byparr instance elsewhere on your
+# network instead (e.g. the LXC install path, or an existing one)? Set
+# FLARESOLVERR_URL in Docker/.env to point at it and this bundled byparr
+# service is simply unused -- nothing above requires it, it's a default,
+# not a hard dependency.
 services:
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: herdsman-byparr
+    # No ports: published -- calendar_api.py reaches it over this
+    # compose file's own internal network at http://byparr:8191, so there's
+    # nothing here that needs to be reachable from outside this stack.
+    # Camoufox is a real (Firefox-based) browser under the hood -- 512mb
+    # is Byparr's own upstream recommendation to avoid renderer crashes
+    # from Docker's default (much smaller) /dev/shm size, the same failure
+    # class every headless-Chrome/Firefox-in-Docker setup hits without it.
+    shm_size: 512mb
+    restart: unless-stopped
+
   herdsman-calendar:
     build:
       context: ..
@@ -12,21 +46,19 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # Required -- Forex Factory now sits behind a Cloudflare JS challenge
-      # (see calendar_api.py's module docstring), so this needs a
-      # FlareSolverr instance's address to fetch anything at all. No
-      # sensible default -- specific to whoever's running this. Copy
-      # Docker/.env.example to Docker/.env and fill in your own instance's
-      # address (compose reads .env automatically from this file's own
-      # directory), or export FLARESOLVERR_URL in your shell before running
-      # `docker compose`.
-      - FLARESOLVERR_URL=${FLARESOLVERR_URL:?Set FLARESOLVERR_URL in Docker/.env -- see Docker/README.md}
+      # Defaults to the bundled byparr service above -- override in
+      # Docker/.env (compose reads it automatically from this file's own
+      # directory) to point at a FlareSolverr or Byparr instance running
+      # elsewhere on your network instead, e.g. if you already have one.
+      - FLARESOLVERR_URL=${FLARESOLVERR_URL:-http://byparr:8191}
     volumes:
       # Whole directory, not filters.json itself -- see the Dockerfile's
       # FILTERS_DIR comment for why a single-file mount is the wrong move
       # here. Survives `docker compose up --build`/image updates; only
       # `docker volume rm` (or `down -v`) actually loses it.
       - herdsman_data:/data
+    depends_on:
+      - byparr
     restart: unless-stopped
 
 volumes:

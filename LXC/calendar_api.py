@@ -910,6 +910,29 @@ def _calendar_needs_short_cadence(now: datetime) -> bool:
     return False
 
 
+def _calendar_has_fomc_this_week() -> bool:
+    """
+    True if the "week" cache has any high-impact event with "FOMC" in its
+    name -- reported directly (2026-08): the week view goes mostly unread
+    day to day, so a real FOMC week (rate decision, minutes, a Fed
+    chair press conference) can go unnoticed until it's already showing up
+    on the day view. Every event in the "week" cache is, by construction,
+    already within the current week (see fetch_week_calendar_events()), so
+    there's no separate date check needed here -- just impact and name.
+    "FOMC" (not a more specific match on "Statement"/"Press Conference"/
+    "Meeting Minutes") deliberately catches all of those plus any other
+    FOMC-titled event Forex Factory adds without this needing an update.
+    """
+    with _calendar_cache_lock:
+        cached = _calendar_cache.get("week")
+    if cached is None:
+        return False
+    return any(
+        event["impact_level"] == 3 and "FOMC" in event["name"].upper()
+        for event in cached["events"]
+    )
+
+
 def _refresh_calendar_cache(range: str) -> None:
     """
     Fetches + parses `range` and updates the cache -- called by
@@ -1075,6 +1098,14 @@ def _build_calendar_response(range: str) -> JSONResponse:
         # age -- see the ESP32 firmware's own use of this field.
         "data_updated_at": cached["fetched_at"].isoformat(),
         "refresh_ok": refresh_ok,
+        # Always sourced from the "week" cache regardless of which `range`
+        # was actually requested -- reported directly (2026-08): the ESP32
+        # only fetches whichever range its currently-active tab needs
+        # (see calendar_view.cpp's refresh_events()), so a flag that only
+        # appeared on the "week" response would never reach the screen for
+        # anyone who mostly stays on the Day tab, which is exactly the
+        # problem this exists to solve. See _calendar_has_fomc_this_week().
+        "fomc_this_week": _calendar_has_fomc_this_week(),
         "count": len(events),
         "events": events,
     })

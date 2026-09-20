@@ -29,15 +29,46 @@ repo on every run, so there's nothing vendored here to fall out of date.
 - `herdsman-calendar-install.sh` — run inside the LXC by `build.func`;
   installs Python, fetches the app, creates the systemd service, and starts it
 
-## Before you start: FlareSolverr is required
+## Before you start: a Cloudflare-challenge solver is required (FlareSolverr or Byparr)
 
-Forex Factory sits behind a Cloudflare JS challenge as of 2026-08 (see
-`calendar_api.py`'s module docstring) -- the API can't fetch the calendar
-at all without a [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr)
-instance to route the request through. It isn't installed by this script
-(it needs a real headless browser, much heavier than this LXC's own 512MB
-default) -- run it separately (its own LXC/container/VM, wherever's
-convenient, as long as this container can reach it), then either:
+Forex Factory sits behind a Cloudflare Turnstile/Managed Challenge as of
+2026-08 (see `calendar_api.py`'s module docstring) -- the API can't fetch
+the calendar at all without something that can solve that challenge and
+hand back the resulting HTML: either
+[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) or
+[Byparr](https://github.com/ThePhaseless/Byparr). Both speak the exact
+same `/v1` API and default port (8191), so `calendar_api.py` doesn't care
+which one is actually on the other end of `FLARESOLVERR_URL` -- same
+setting either way, see below.
+
+**Byparr is the one to reach for now.** Reported directly (2026-08):
+FlareSolverr's Selenium/undetected-chromedriver approach reliably failed
+to clear Forex Factory's current Turnstile challenge -- every solve
+attempt timed out against FlareSolverr's own 60s budget, confirmed
+directly with a raw `curl` against its own `/v1` endpoint, not just
+inferred from calendar_api.py's logs. Byparr's Camoufox-backed solver
+(a hardened Firefox build with fingerprints patched at the C++ level)
+cleared the same challenge in the same test. FlareSolverr may well recover
+this ground later, or some other tool may take Byparr's place -- whichever
+one currently works against Forex Factory is the one to point at, and
+that's Byparr as of this writing. Byparr also has its own Proxmox VE
+Community Script:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/byparr.sh)"
+```
+
+(Double-check the exact current command against
+[community-scripts.github.io/ProxmoxVE](https://community-scripts.github.io/ProxmoxVE)
+before running -- this project doesn't control that script and it can
+change. FlareSolverr has its own install instructions in its own README if
+you'd rather use that instead, or already run one of these for other
+purposes, e.g. other *arr apps.)
+
+Neither is installed by this script (either needs a real headless/hardened
+browser, much heavier than this LXC's own 512MB default) -- run one
+separately (its own LXC/container/VM, wherever's convenient, as long as
+this container can reach it), then either:
 
 - Fresh install: `export FLARESOLVERR_URL=http://<host>:8191` before
   running the install command below -- picked up automatically *if*
@@ -65,6 +96,26 @@ either serve nothing yet (a 503 right after a fresh start) or, if it had
 previously fetched real data before `FLARESOLVERR_URL` went missing,
 keep serving that increasingly stale copy indefinitely. Check the logs,
 not the client response, if you're not sure whether it's set.
+
+To verify the solver itself can actually solve Forex Factory's challenge
+right now (not just that it's reachable -- a plain root `curl` answering
+200 doesn't confirm this, confirmed directly: FlareSolverr's root page
+kept responding fine throughout the exact window it couldn't solve
+anything), issue a real solve request against its own `/v1` API directly:
+
+```bash
+curl -s -m 70 -X POST http://<solver-host>:8191/v1 -H "Content-Type: application/json" \
+  -d '{"cmd":"request.get","url":"https://www.forexfactory.com/calendar?day=today","maxTimeout":60000}' \
+  -o /tmp/solver_test.json -w "http_status=%{http_code} time=%{time_total}s\n"
+cat /tmp/solver_test.json | head -c 500
+```
+
+A working solver returns `http_status=200` with real calendar HTML inside
+`solution.response` in well under `maxTimeout`. `"status": "error"` with an
+`"Error solving the challenge"` message (regardless of what HTTP status
+code wraps it) means the solver itself is up but genuinely can't clear the
+current challenge -- time to reconsider which solver is currently working
+against Forex Factory, not a `calendar_api.py` bug.
 
 ## Quick install
 
@@ -359,12 +410,17 @@ themselves being blanked.
   error, only stale data or, right after a fresh start, a 503), check
   `journalctl -u herdsman-calendar-api -f` for
   `Background refresh of /calendar?range=... failed: ...` lines, then
-  check FlareSolverr before assuming `calendar_api.py` broke: is it
+  check the solver (FlareSolverr or Byparr, whichever `FLARESOLVERR_URL`
+  actually points at) before assuming `calendar_api.py` broke: is it
   running, is `FLARESOLVERR_URL` set correctly on this service
   (`systemctl cat herdsman-calendar-api` shows the effective config,
   including any `systemctl edit` drop-in), and can it still solve Forex
-  Factory's challenge right now -- Cloudflare's own challenge mechanics
-  change too, independent of anything in this repo.
+  Factory's challenge right now -- a raw `curl -X POST .../v1` with a real
+  `request.get` (see the example further up) confirms that directly rather
+  than inferring it from `calendar_api.py`'s own logs. Cloudflare's own
+  challenge mechanics change too, independent of anything in this repo --
+  this is exactly what broke FlareSolverr specifically in 2026-08, see
+  "Before you start" above.
 - If event times look off by a fixed offset (commonly "+1 hour" during
   EDT), that's Forex Factory's IP-geolocated timezone default, not a bug in
   this scraper -- `fetch_calendar_html()` should self-heal it automatically
@@ -454,6 +510,22 @@ themselves being blanked.
   refreshes were never affected by this -- that one already runs as a real
   `threading.Thread`, not on the event loop, only this one-time startup
   path had the bug.
+- `/calendar` gained a `fomc_this_week` field (2026-09), reported directly
+  as a real gap: the week view goes mostly unread day to day, so a real
+  FOMC week could go unnoticed on the ESP32 until it was already showing
+  up on the Day tab. `_calendar_has_fomc_this_week()` scans the "week"
+  cache for any high-impact event with "FOMC" in its name -- deliberately
+  a broad substring match (not specific to "Statement"/"Press Conference"/
+  "Minutes") so a new FOMC-titled event Forex Factory adds doesn't
+  silently fall through it. Always computed from the "week" cache and
+  included in *every* `/calendar` response regardless of the requested
+  `range` -- the ESP32 firmware only fetches whichever range its active
+  tab needs (see `calendar_view.cpp`'s `refresh_events()`), so a flag that
+  only appeared on the "week" response would never reach the screen for
+  anyone who mostly stays on Day, which is exactly the problem this
+  exists to solve. See `ESP32/README.md`'s own writeup for the firmware
+  side (a small bordered "FOMC WEEK" badge next to the title, shown
+  regardless of active tab).
 - A cache layer would be a good next step if the API is polled frequently.
 
 ## License

@@ -22,35 +22,55 @@ out of sync with each other.
   Dockerfile by name so Docker finds it regardless of context location --
   see its own comment if your Docker version is old enough that this
   doesn't apply).
-- `.env.example` -- template for the one required setting
-  (`FLARESOLVERR_URL`, see below). Copy to `.env` (gitignored) and fill in
-  your own value -- `docker-compose.yml` reads it automatically.
+- `.env.example` -- template for the one optional setting
+  (`FLARESOLVERR_URL`, see below). Only needed if you want to point at a
+  challenge-solver running elsewhere instead of the bundled one -- copy to
+  `.env` (gitignored) and fill in your own value if so;
+  `docker-compose.yml` reads it automatically.
 
-## Before you start: FlareSolverr is required
+## Before you start: a Cloudflare-challenge solver, bundled by default
 
-Forex Factory sits behind a Cloudflare JS challenge as of 2026-08 (see
-`calendar_api.py`'s module docstring) -- this service can't fetch the
-calendar at all without a [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr)
-instance to route the request through. FlareSolverr isn't bundled into
-this image (it needs a real headless browser, a much heavier dependency
-than this service's own footprint) -- run it separately (its own
-container is the usual way; a one-liner is in its own README) somewhere
-reachable from wherever this container ends up, then:
+Forex Factory sits behind a Cloudflare Turnstile/Managed Challenge as of
+2026-08 (see `calendar_api.py`'s module docstring) -- this service can't
+fetch the calendar at all without something that can solve that challenge
+and hand back the resulting HTML. `docker-compose.yml` bundles
+[Byparr](https://github.com/ThePhaseless/Byparr) as its own service for
+exactly this, wired up automatically -- **`docker compose up` alone is
+enough, nothing to configure first.**
+
+Byparr, not [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr),
+was chosen deliberately: both speak the same `/v1` API and default port
+(8191), so either works here with zero code changes, but FlareSolverr's
+Selenium/undetected-chromedriver approach reliably failed to clear Forex
+Factory's current Turnstile challenge in direct testing (every solve
+attempt timed out against FlareSolverr's own 60s budget), while Byparr's
+Camoufox-backed solver cleared it -- see `LXC/README.md`'s own writeup of
+that investigation. Byparr isn't baked into `herdsman-calendar`'s own image
+(same reasoning FlareSolverr always had here: a real browser is a much
+heavier dependency than this service's own footprint) -- it's a sibling
+container in the same compose file instead, reachable internally at
+`http://byparr:8191`, nothing published to the host.
+
+Already run your own FlareSolverr or Byparr elsewhere (e.g. for other *arr
+apps)? Point at that instead of the bundled one:
 
 ```bash
 cp Docker/.env.example Docker/.env
-# edit Docker/.env, set FLARESOLVERR_URL to your instance's address
+# uncomment FLARESOLVERR_URL in Docker/.env, set it to your instance's address
 ```
 
-Without this, the container still starts, but its background calendar
-refresh (see "How /calendar stays fast" below) can never actually
-succeed -- `docker logs -f herdsman-calendar` shows a clear
-`FLARESOLVERR_URL is not configured...` error on every refresh attempt.
+Whichever solver ends up unreachable or misconfigured, the container still
+starts, but its background calendar refresh (see "How /calendar stays
+fast" below) can never actually succeed -- `docker logs -f herdsman-calendar`
+shows a clear `Background refresh of /calendar?range=... failed: ...` error
+on every attempt (check `docker logs -f herdsman-byparr` too, if you're
+using the bundled one -- a Camoufox crash from too little shared memory is
+the most common cause, see `docker-compose.yml`'s own `shm_size` comment).
 `/calendar` itself won't show that error directly; it'll either serve
-nothing yet (a 503 right after a fresh start) or keep serving
-increasingly stale data if it had fetched successfully before
-`FLARESOLVERR_URL` went missing. Check the logs, not the client
-response, if you're not sure whether it's set.
+nothing yet (a 503 right after a fresh start) or keep serving increasingly
+stale data if it had fetched successfully before the solver became
+unreachable. Check the logs, not the client response, if you're not sure
+what's wrong.
 
 ## Quick start (docker compose)
 
@@ -68,19 +88,36 @@ across rebuilds/recreations. Rebuilding after pulling a newer
 ## Quick start (plain `docker`, no compose)
 
 Also from the repo root -- note the `-f`/context arguments, since the
-Dockerfile isn't in the current directory. No `.env` file here (that's a
-compose-specific convenience) -- pass `FLARESOLVERR_URL` directly:
+Dockerfile isn't in the current directory. `docker-compose.yml`'s bundled
+Byparr service is a compose-specific convenience -- plain `docker run`
+needs its own container for it, run once and reused across
+`herdsman-calendar` restarts/rebuilds:
 
 ```bash
+docker run -d \
+  --name herdsman-byparr \
+  --shm-size 512m \
+  --restart unless-stopped \
+  ghcr.io/thephaseless/byparr:latest
+
 docker build -f Docker/Dockerfile -t herdsman-calendar:latest .
 docker run -d \
   --name herdsman-calendar \
   -p 8080:8080 \
-  -e FLARESOLVERR_URL=http://192.168.1.50:8191 \
+  -e FLARESOLVERR_URL=http://herdsman-byparr:8191 \
+  --link herdsman-byparr \
   -v herdsman_data:/data \
   --restart unless-stopped \
   herdsman-calendar:latest
 ```
+
+(`--link` is legacy Docker, but it's the simplest way for one plain
+`docker run` container to resolve another by name without hand-rolling a
+user-defined network -- `docker-compose.yml` gets this for free from
+compose's own default network, which is the main reason it's the
+recommended path over this one. Already running FlareSolverr or Byparr
+elsewhere instead? Skip the first `docker run` above and point
+`FLARESOLVERR_URL` at that instance's address directly.)
 
 `-v herdsman_data:/data` is the same volume/mount-point the compose file
 uses -- a whole directory, not `filters.json` itself. See the Dockerfile's
@@ -102,11 +139,16 @@ or run directly:
 docker run -d \
   --name herdsman-calendar \
   -p 8080:8080 \
-  -e FLARESOLVERR_URL=http://192.168.1.50:8191 \
+  -e FLARESOLVERR_URL=http://herdsman-byparr:8191 \
+  --link herdsman-byparr \
   -v herdsman_data:/data \
   --restart unless-stopped \
   <your-dockerhub-username>/herdsman-calendar:latest
 ```
+
+(Assumes the same `herdsman-byparr` container from "Quick start (plain
+docker, no compose)" above is already running -- swap `FLARESOLVERR_URL`
+for wherever your own solver actually lives if you're not using it.)
 
 ## Testing the API
 
@@ -221,10 +263,15 @@ If `/calendar` is serving stale or empty data (see "How /calendar stays
 fast" above -- a background refresh failure never surfaces as a client
 error), check `docker logs -f herdsman-calendar` for
 `Background refresh of /calendar?range=... failed: ...` lines, then check
-FlareSolverr itself before assuming `calendar_api.py` broke: is it still
-running, is `FLARESOLVERR_URL` in `Docker/.env` still correct, and can it
-still solve Forex Factory's challenge right now (Cloudflare's own
-challenge mechanics change too, independent of anything in this repo).
+the solver itself before assuming `calendar_api.py` broke: is
+`herdsman-byparr` (or your own FlareSolverr/Byparr, if you're pointing at
+one instead) still running (`docker logs -f herdsman-byparr`), is
+`FLARESOLVERR_URL` still correct (unset in `Docker/.env` means it's using
+the bundled `byparr` service by default -- see "Before you start" above),
+and can it still solve Forex Factory's challenge right now (Cloudflare's
+own challenge mechanics change too, independent of anything in this repo
+-- this is exactly what broke FlareSolverr specifically in 2026-08, see
+`LXC/README.md`).
 
 If event times look off by a fixed offset instead (commonly "+1 hour"
 during EDT), that's Forex Factory's IP-geolocated timezone default, not a

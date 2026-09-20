@@ -94,5 +94,13 @@ bool calendar_client_save_filters(const CalendarFilters & filters);
  * the field is missing (an older calendar_api.py without this field) so
  * this never regresses into a false alarm against a backend that simply
  * predates it.
+ *
+ * fomc_this_week_out is set from the response's own "fomc_this_week" field
+ * -- true if any high-impact FOMC event falls in the current week,
+ * regardless of which `range` was actually requested (calendar_api.py
+ * always sources this from its own "week" cache -- see its own
+ * _build_calendar_response() comment on why). Defaults to false if the
+ * field is missing, same reasoning as refresh_ok_out.
  */
-bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out, bool & refresh_ok_out);
+bool calendar_client_get_calendar(const String & range, std::vector<CalendarEvent> & out, bool & refresh_ok_out,
+                                   bool & fomc_this_week_out);

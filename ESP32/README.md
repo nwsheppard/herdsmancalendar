@@ -2726,6 +2726,36 @@ after boot, same as `list`/`header`) and toggled hidden/visible by
 per refresh. Compiles clean (RAM 35.3%, Flash 71.2% -- unchanged at this
 rounding).
 
+## 2026-09: FOMC-week badge
+
+Reported directly: the week view goes mostly unread day to day (the Day
+tab is what actually gets checked), so a real FOMC week -- rate decision,
+minutes, a press conference -- could go unnoticed until it was already
+showing up on the day view, too late to plan around. Added a small bordered
+"FOMC WEEK" badge next to the "UPCOMING EVENTS" title, in the gap between
+it and the gear/WiFi icons -- visible regardless of which tab is active,
+since this is exactly the thing that's easy to miss by only ever looking
+at Day.
+
+Computed backend-side, not by the ESP32 scanning events itself: `calendar_api.py`'s
+`/calendar` response gained a `fomc_this_week` field (any high-impact event
+with "FOMC" in its name, in the current `week` cache), always present
+regardless of which `range` was actually requested -- `refresh_events()`
+only fetches whichever range the active tab needs, so a flag that only
+showed up on the `week` response would never reach the screen for anyone
+who mostly stays on Day, exactly the problem this exists to solve. See
+`LXC/README.md`'s own writeup for the backend side.
+
+`calendar_client_get_calendar()` gained a `fomc_this_week_out` param
+alongside the existing `refresh_ok_out`, same isNull()-defaults-false
+pattern for an older backend without the field. The badge is only
+touched on a *successful* fetch (a transient failure shouldn't flicker it
+off and back on by the next retry a few seconds later) -- unlike
+`current_events`, which is deliberately cleared on any failure since
+alert_manager acts on it; this is a much lower-stakes, weekly-timescale
+indicator. Compiles clean (RAM 35.3%, Flash 71.2% -- unchanged at this
+rounding).
+
 ## Known quirks
 
 - `esp32-s3-devkitc-1-myboard.json` is copied from Elecrow's example
