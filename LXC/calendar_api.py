@@ -220,6 +220,15 @@ CALENDAR_TIMEZONE = ZoneInfo(FOREX_FACTORY_TIMEZONE_NAME)
 # doesn't need to bundle a browser.
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "").rstrip("/")
 
+# Debug-only override for _calendar_has_fomc_this_week() -- lets the badge
+# (see ESP32/README.md's own "FOMC-week badge" writeup) be exercised on
+# real hardware without waiting for an actual FOMC week or hand-editing the
+# cache. Deliberately an env var, not a query param/endpoint -- nothing a
+# client (the ESP32 included) can flip on its own, only whoever can already
+# touch this service's own environment. Unset (the default) means "use the
+# real computation," same as if this didn't exist at all.
+CALENDAR_DEBUG_FORCE_FOMC_THIS_WEEK = os.environ.get("CALENDAR_DEBUG_FORCE_FOMC_THIS_WEEK", "") == "1"
+
 # --- Filters (impact level + currencies), user-configurable via /filters ----
 
 # Defaults to sitting next to this file (the LXC install's own behavior,
@@ -922,7 +931,13 @@ def _calendar_has_fomc_this_week() -> bool:
     "FOMC" (not a more specific match on "Statement"/"Press Conference"/
     "Meeting Minutes") deliberately catches all of those plus any other
     FOMC-titled event Forex Factory adds without this needing an update.
+
+    CALENDAR_DEBUG_FORCE_FOMC_THIS_WEEK short-circuits this to always
+    return True, for testing the ESP32 badge on demand -- see its own
+    comment.
     """
+    if CALENDAR_DEBUG_FORCE_FOMC_THIS_WEEK:
+        return True
     with _calendar_cache_lock:
         cached = _calendar_cache.get("week")
     if cached is None:

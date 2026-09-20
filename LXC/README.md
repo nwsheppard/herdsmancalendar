@@ -526,6 +526,22 @@ themselves being blanked.
   exists to solve. See `ESP32/README.md`'s own writeup for the firmware
   side (a small bordered "FOMC WEEK" badge next to the title, shown
   regardless of active tab).
+
+  To see the badge on real hardware without waiting for an actual FOMC
+  week, force it on:
+  ```bash
+  pct exec <ctid> -- systemctl edit herdsman-calendar-api
+  # add under [Service]:
+  #   Environment=CALENDAR_DEBUG_FORCE_FOMC_THIS_WEEK=1
+  pct exec <ctid> -- systemctl restart herdsman-calendar-api
+  ```
+  (Docker: add `CALENDAR_DEBUG_FORCE_FOMC_THIS_WEEK=1` to `Docker/.env` or
+  pass `-e CALENDAR_DEBUG_FORCE_FOMC_THIS_WEEK=1` on `docker run`, then
+  restart the container.) Every `/calendar` response now claims
+  `fomc_this_week: true` -- the ESP32 should show the badge on its next
+  refresh, no reflash needed. Remove that override line (or set it to
+  anything other than `1`) and restart again once you're done -- it isn't
+  meant to be left on.
 - A cache layer would be a good next step if the API is polled frequently.
 
 ## License
